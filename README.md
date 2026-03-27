@@ -1,13 +1,94 @@
-# Sample Plugin
-Author: **Vector 35 Inc**
+# Binja-NO-MCP
+Author: **Jeremiah**
 
-_This is a short description meant to fit on one line._
+Export the current Binary Ninja `BinaryView` into a stable on-disk tree for AI IDE workflows.
 
-## Description:
-This is a longer description meant for a sample plugin that demonstrates the metadata format for Binary Ninja plugins. Note that the [community-plugins repo](https://github.com/Vector35/community-plugins) contains a useful [utility](https://github.com/Vector35/community-plugins/blob/master/generate_plugininfo.py) to validate the plugin.json. Additionally, the [release helper](https://github.com/Vector35/release_helper) plugin is helpful for more easily pushing new releases, incrementing versions, and creating the appropriate GitHub tags.
+## Scope
 
-Note that originally we recommended specifying the contents of this entire file inside of the [plugin.json](./plugin.json) but the latest repository generator will use the readme contents directly which means you should simply leave an empty longdescription field. 
+Current UI workflow:
+
+- exports only `bv.functions`
+- keeps the exporter read-only
+- lets you choose the output directory manually in a form
+- exports raw HLIL by default
+- lets you choose pseudo-C / MLIL / MLIL SSA / LLIL as optional exports in the UI
+- writes the function declaration into the exported HLIL header and `.meta.json`
+- always exports per-function metadata and global metadata
+
+## Output Layout
+
+```text
+binja-no-mcp-export/
+  meta/
+    binary.json
+    export_config.json
+    failures.jsonl
+    function_index.jsonl
+    sections.json
+    segments.json
+  functions/
+    0000000000088504_sub_88504.hlil.txt
+    0000000000088504_sub_88504.meta.json
+  data/
+    strings.jsonl
+    data_vars.jsonl
+    symbols.jsonl
+  optional/
+    pseudoc/
+      0000000000088504_sub_88504.pseudoc.c
+    mlil/
+      0000000000088504_sub_88504.mlil.txt
+    mlil_ssa/
+      0000000000088504_sub_88504.mlil_ssa.txt
+    llil/
+      0000000000088504_sub_88504.llil.txt
+```
+
+## UI Usage
+
+1. Open the sample in Binary Ninja and let the analysis state settle to exactly what you want to export.
+2. Run `Plugins -> Export for AI`.
+3. In the form, choose the output directory.
+4. Select which IL layers to export.
+
+Defaults:
+
+- HLIL: enabled
+- pseudo-C: disabled
+- MLIL: disabled
+- MLIL SSA: disabled
+- LLIL: disabled
+
+Always exported:
+
+- `*.meta.json`
+- `meta/function_index.jsonl`
+- `meta/failures.jsonl`
+- `meta/binary.json`
+- `meta/export_config.json`
+- `meta/sections.json`
+- `meta/segments.json`
+- `data/strings.jsonl`
+- `data/data_vars.jsonl`
+- `data/symbols.jsonl`
+
+## Notes
+
+- The exporter never adds functions, entry points, sections, symbols, or refs.
+- `run_export` itself does not call `update_analysis_and_wait()`.
+- Optional pseudo-C / MLIL / MLIL SSA / LLIL exports are only generated when you explicitly enable them in the form.
+
+## Development Notes
+
+Project layout follows the requested split:
+
+- `binja_no_mcp/config.py`
+- `binja_no_mcp/collectors/`
+- `binja_no_mcp/renderers/`
+- `binja_no_mcp/exporters/`
+- `binja_no_mcp/models/`
+- `binja_no_mcp/plugin.py`
 
 ## License
 
-This plugin is released under an [MIT license](./license).
+This plugin is released under the [MIT license](./LICENSE).

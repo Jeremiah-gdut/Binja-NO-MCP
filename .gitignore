@@ -1,1 +1,3 @@
 *.pyc
+__pycache__/
+binja-no-mcp-export/
