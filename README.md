@@ -10,7 +10,7 @@ Current UI workflow:
 - exports only `bv.functions`
 - keeps the exporter read-only
 - lets you choose the output directory manually in a form
-- exports raw HLIL by default
+- exports raw HLIL linear-view text by default
 - lets you choose pseudo-C / MLIL / MLIL SSA / LLIL as optional exports in the UI
 - writes the function declaration into the exported HLIL header and `.meta.json`
 - always exports per-function metadata and global metadata
