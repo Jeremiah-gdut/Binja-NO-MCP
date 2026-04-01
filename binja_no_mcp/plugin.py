@@ -9,7 +9,7 @@ from binaryninja.plugin import BackgroundTask
 
 from .collectors import freeze_recognized_function_keys, resolve_recognized_functions
 from .config import ExportConfig
-from .export_runner import run_export
+from .export_runner import export_function, finalize_export_session, prepare_export_session, run_export
 
 PLUGIN_COMMAND_NAME = "Export for AI"
 PLUGIN_COMMAND_DESCRIPTION = "Export recognized functions, IL, and metadata for AI IDEs"
@@ -107,32 +107,86 @@ def export_for_ai(bv: object) -> None:
         return
 
     function_keys = freeze_recognized_function_keys(bv)
+    if not function_keys:
+        show_message_box(
+            "Export for AI",
+            "No recognized functions are available for export.",
+            MessageBoxButtonSet.OKButtonSet,
+            MessageBoxIcon.InformationIcon,
+        )
+        return
+
     task = BackgroundTask("Preparing export for AI", False)
+
+    if not cfg.reanalyze_before_export:
+        try:
+            summary = run_export(bv, cfg, function_keys=function_keys)
+        except Exception as exc:
+            task.finish()
+            log_error(f"Binja-NO-MCP export failed: {exc}")
+            _show_failure(exc)
+            return
+        task.finish()
+        _show_completion(summary)
+        return
+
+    try:
+        session = prepare_export_session(bv, cfg, function_keys)
+    except Exception as exc:
+        task.finish()
+        log_error(f"Binja-NO-MCP export failed before scheduling: {exc}")
+        _show_failure(exc)
+        return
+
+    state = {"index": 0, "retry_count": 0}
+
+    def schedule_next_reanalysis() -> None:
+        index = state["index"]
+        if index >= len(function_keys):
+            summary = finalize_export_session(session, bv)
+            task.finish()
+            execute_on_main_thread(lambda summary=summary: _show_completion(summary))
+            if event in _PENDING_EXPORT_EVENTS:
+                _PENDING_EXPORT_EVENTS.remove(event)
+            return
+
+        function_key = function_keys[index]
+        task.progress = f"Reanalyzing function {index + 1}/{len(function_keys)}"
+        _request_function_reanalysis(bv, [function_key])
+        bv.update_analysis()
 
     def completion_callback() -> None:
         try:
-            task.progress = "Exporting function data"
-            summary = run_export(bv, cfg, function_keys=function_keys)
+            index = state["index"]
+            if index >= len(function_keys):
+                return
+
+            function_key = function_keys[index]
+            func = resolve_recognized_functions(bv, [function_key])
+            if func and getattr(func[0], "needs_update", False) and state["retry_count"] < 3:
+                state["retry_count"] += 1
+                task.progress = f"Waiting for function {index + 1}/{len(function_keys)} analysis to settle"
+                bv.update_analysis()
+                return
+
+            task.progress = f"Exporting function {index + 1}/{len(function_keys)}"
+            export_function(session, bv, function_key)
+            state["index"] += 1
+            state["retry_count"] = 0
+            schedule_next_reanalysis()
         except Exception as exc:
             log_error(f"Binja-NO-MCP export failed: {exc}")
             execute_on_main_thread(lambda exc=exc: _show_failure(exc))
-        else:
-            execute_on_main_thread(lambda summary=summary: _show_completion(summary))
-        finally:
             task.finish()
             if event in _PENDING_EXPORT_EVENTS:
                 _PENDING_EXPORT_EVENTS.remove(event)
+            return
 
     event = bv.add_analysis_completion_event(completion_callback)
     _PENDING_EXPORT_EVENTS.append(event)
 
     try:
-        if cfg.reanalyze_before_export:
-            task.progress = "Reanalyzing frozen functions"
-            _request_function_reanalysis(bv, function_keys)
-        else:
-            task.progress = "Waiting for pending analysis before export"
-        bv.update_analysis()
+        schedule_next_reanalysis()
     except Exception as exc:
         task.finish()
         if event in _PENDING_EXPORT_EVENTS:

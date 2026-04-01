@@ -10,7 +10,7 @@ Current UI workflow:
 - exports only `bv.functions`
 - keeps the exporter read-only
 - freezes the recognized function set before export scheduling
-- reanalyzes those frozen functions before export by default so workflow-driven changes land in IL and metadata
+- reanalyzes each frozen function and exports it immediately after its analysis completes by default
 - lets you choose the output directory manually in a form
 - exports raw HLIL linear-view text by default
 - lets you choose pseudo-C / MLIL / MLIL SSA / LLIL as optional exports in the UI
@@ -78,7 +78,7 @@ Always exported:
 ## Notes
 
 - The exporter never adds functions, entry points, sections, symbols, or refs.
-- The UI command schedules reanalysis first and exports only after Binary Ninja reports analysis completion.
+- The UI command serializes `reanalyze current function -> analysis completion -> export current function`.
 - `run_export` itself does not call `update_analysis_and_wait()`.
 - Optional pseudo-C / MLIL / MLIL SSA / LLIL exports are only generated when you explicitly enable them in the form.
 
