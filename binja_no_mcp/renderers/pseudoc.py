@@ -1,14 +1,9 @@
 from __future__ import annotations
 
+from .linear_text import render_linear_lines
+
 PSEUDO_C_ATTRIBUTE = "pseudo_c_if_available"
 LANGUAGE_REPRESENTATION_ATTRIBUTE = "language_representation_if_available"
-
-
-def _line_to_text(line: object) -> str:
-    tokens = getattr(line, "tokens", None)
-    if not tokens:
-        return str(line)
-    return "".join(getattr(token, "text", str(token)) for token in tokens)
 
 
 def _fallback_pseudoc(hlil: object) -> str:
@@ -39,5 +34,5 @@ def render_pseudoc(hlil: object, declaration: str | None = None) -> str:
         return _prepend_declaration(_fallback_pseudoc(hlil), declaration)
 
     lines = renderer.get_linear_lines(root)
-    rendered = "\n".join(_line_to_text(line) for line in lines).rstrip()
+    rendered = render_linear_lines(lines, func).rstrip()
     return _prepend_declaration(rendered + "\n", declaration)

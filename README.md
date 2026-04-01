@@ -13,6 +13,7 @@ Current UI workflow:
 - reanalyzes each frozen function and exports it immediately after its analysis completes by default
 - lets you choose the output directory manually in a form
 - exports raw HLIL linear-view text by default
+- preserves address comments from the current analysis view in exported linear HLIL / pseudo-C when available
 - lets you choose pseudo-C / MLIL / MLIL SSA / LLIL as optional exports in the UI
 - writes the function declaration into the exported HLIL header and `.meta.json`
 - always exports per-function metadata and global metadata
