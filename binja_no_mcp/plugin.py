@@ -138,7 +138,7 @@ def export_for_ai(bv: object) -> None:
         _show_failure(exc)
         return
 
-    state = {"index": 0, "retry_count": 0, "event": None, "closed": False}
+    state = {"index": 0, "retry_count": 0, "event": None, "closed": False, "reanalyze_requested": False}
 
     def _remove_pending_event(event: object | None) -> None:
         if event in _PENDING_EXPORT_EVENTS:
@@ -174,14 +174,28 @@ def export_for_ai(bv: object) -> None:
         bv.update_analysis()
 
     def schedule_next_reanalysis() -> None:
-        index = state["index"]
-        if index >= len(function_keys):
-            _finish_success()
-            return
+        while not state["closed"]:
+            index = state["index"]
+            if index >= len(function_keys):
+                _finish_success()
+                return
 
-        function_key = function_keys[index]
-        _request_function_reanalysis(bv, [function_key])
-        _wait_for_analysis(f"Reanalyzing function {index + 1}/{len(function_keys)}")
+            function_key = function_keys[index]
+            if not state["reanalyze_requested"]:
+                task.progress = f"Reanalyzing function {index + 1}/{len(function_keys)}"
+                _request_function_reanalysis(bv, [function_key])
+                state["reanalyze_requested"] = True
+
+            func = resolve_recognized_functions(bv, [function_key])
+            if func and getattr(func[0], "needs_update", False):
+                _wait_for_analysis(f"Waiting for function {index + 1}/{len(function_keys)} analysis to settle")
+                return
+
+            task.progress = f"Exporting function {index + 1}/{len(function_keys)}"
+            export_function(session, bv, function_key)
+            state["index"] += 1
+            state["retry_count"] = 0
+            state["reanalyze_requested"] = False
 
     def completion_callback() -> None:
         current_event = state["event"]
@@ -208,6 +222,7 @@ def export_for_ai(bv: object) -> None:
             export_function(session, bv, function_key)
             state["index"] += 1
             state["retry_count"] = 0
+            state["reanalyze_requested"] = False
             schedule_next_reanalysis()
         except Exception as exc:
             _finish_failure(exc)
