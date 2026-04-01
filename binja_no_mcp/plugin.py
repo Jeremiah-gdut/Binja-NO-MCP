@@ -4,8 +4,8 @@ from pathlib import Path
 
 from binaryninja import MessageBoxButtonSet, MessageBoxIcon, PluginCommand, log_error
 from binaryninja.interaction import CheckboxField, DirectoryNameField, get_form_input, show_message_box
-from binaryninja.mainthread import execute_on_main_thread
-from binaryninja.plugin import BackgroundTask
+from binaryninja.mainthread import execute_on_main_thread, execute_on_main_thread_and_wait
+from binaryninja.plugin import BackgroundTaskThread
 
 from .collectors import freeze_recognized_function_keys, resolve_recognized_functions
 from .config import ExportConfig
@@ -14,7 +14,6 @@ from .export_runner import export_function, finalize_export_session, prepare_exp
 PLUGIN_COMMAND_NAME = "Export for AI"
 PLUGIN_COMMAND_DESCRIPTION = "Export recognized functions, IL, and metadata for AI IDEs"
 _PLUGIN_REGISTERED = False
-_PENDING_EXPORT_EVENTS: list[object] = []
 
 
 def _default_output_dir(bv: object) -> Path:
@@ -101,6 +100,40 @@ def _request_function_reanalysis(bv: object, function_keys: list[tuple[int, str 
             reanalyze()
 
 
+class _ExportTask(BackgroundTaskThread):
+    def __init__(self, bv: object, cfg: ExportConfig, function_keys: list[tuple[int, str | None]]) -> None:
+        super().__init__("Preparing export for AI", False)
+        self._bv = bv
+        self._cfg = cfg
+        self._function_keys = function_keys
+
+    def run(self) -> None:
+        try:
+            session = prepare_export_session(self._bv, self._cfg, self._function_keys)
+            total = len(self._function_keys)
+
+            for index, function_key in enumerate(self._function_keys, start=1):
+                if self.cancelled:
+                    break
+
+                if self._cfg.reanalyze_before_export:
+                    self.progress = f"Reanalyzing function {index}/{total}"
+                    execute_on_main_thread_and_wait(
+                        lambda function_key=function_key: _request_function_reanalysis(self._bv, [function_key])
+                    )
+                    self.progress = f"Waiting for function {index}/{total} analysis to finish"
+                    self._bv.update_analysis_and_wait()
+
+                self.progress = f"Exporting function {index}/{total}"
+                export_function(session, self._bv, function_key)
+
+            summary = finalize_export_session(session, self._bv)
+            execute_on_main_thread(lambda summary=summary: _show_completion(summary))
+        except Exception as exc:
+            log_error(f"Binja-NO-MCP export failed: {exc}")
+            execute_on_main_thread(lambda exc=exc: _show_failure(exc))
+
+
 def export_for_ai(bv: object) -> None:
     cfg = _prompt_export_config(bv)
     if cfg is None:
@@ -116,121 +149,18 @@ def export_for_ai(bv: object) -> None:
         )
         return
 
-    task = BackgroundTask("Preparing export for AI", False)
-
     if not cfg.reanalyze_before_export:
         try:
             summary = run_export(bv, cfg, function_keys=function_keys)
         except Exception as exc:
-            task.finish()
             log_error(f"Binja-NO-MCP export failed: {exc}")
             _show_failure(exc)
             return
-        task.finish()
         _show_completion(summary)
         return
 
-    try:
-        session = prepare_export_session(bv, cfg, function_keys)
-    except Exception as exc:
-        task.finish()
-        log_error(f"Binja-NO-MCP export failed before scheduling: {exc}")
-        _show_failure(exc)
-        return
-
-    state = {"index": 0, "retry_count": 0, "event": None, "closed": False, "reanalyze_requested": False}
-
-    def _remove_pending_event(event: object | None) -> None:
-        if event in _PENDING_EXPORT_EVENTS:
-            _PENDING_EXPORT_EVENTS.remove(event)
-
-    def _finish_success() -> None:
-        if state["closed"]:
-            return
-        state["closed"] = True
-        _remove_pending_event(state["event"])
-        state["event"] = None
-        summary = finalize_export_session(session, bv)
-        task.finish()
-        execute_on_main_thread(lambda summary=summary: _show_completion(summary))
-
-    def _finish_failure(exc: Exception) -> None:
-        if state["closed"]:
-            return
-        state["closed"] = True
-        _remove_pending_event(state["event"])
-        state["event"] = None
-        log_error(f"Binja-NO-MCP export failed: {exc}")
-        task.finish()
-        execute_on_main_thread(lambda exc=exc: _show_failure(exc))
-
-    def _wait_for_analysis(progress: str) -> None:
-        if state["closed"]:
-            return
-        task.progress = progress
-        event = bv.add_analysis_completion_event(completion_callback)
-        state["event"] = event
-        _PENDING_EXPORT_EVENTS.append(event)
-        bv.update_analysis()
-
-    def schedule_next_reanalysis() -> None:
-        while not state["closed"]:
-            index = state["index"]
-            if index >= len(function_keys):
-                _finish_success()
-                return
-
-            function_key = function_keys[index]
-            if not state["reanalyze_requested"]:
-                task.progress = f"Reanalyzing function {index + 1}/{len(function_keys)}"
-                _request_function_reanalysis(bv, [function_key])
-                state["reanalyze_requested"] = True
-
-            func = resolve_recognized_functions(bv, [function_key])
-            if func and getattr(func[0], "needs_update", False):
-                _wait_for_analysis(f"Waiting for function {index + 1}/{len(function_keys)} analysis to settle")
-                return
-
-            task.progress = f"Exporting function {index + 1}/{len(function_keys)}"
-            export_function(session, bv, function_key)
-            state["index"] += 1
-            state["retry_count"] = 0
-            state["reanalyze_requested"] = False
-
-    def completion_callback() -> None:
-        current_event = state["event"]
-        state["event"] = None
-        _remove_pending_event(current_event)
-
-        if state["closed"]:
-            return
-
-        try:
-            index = state["index"]
-            if index >= len(function_keys):
-                _finish_success()
-                return
-
-            function_key = function_keys[index]
-            func = resolve_recognized_functions(bv, [function_key])
-            if func and getattr(func[0], "needs_update", False) and state["retry_count"] < 3:
-                state["retry_count"] += 1
-                _wait_for_analysis(f"Waiting for function {index + 1}/{len(function_keys)} analysis to settle")
-                return
-
-            task.progress = f"Exporting function {index + 1}/{len(function_keys)}"
-            export_function(session, bv, function_key)
-            state["index"] += 1
-            state["retry_count"] = 0
-            state["reanalyze_requested"] = False
-            schedule_next_reanalysis()
-        except Exception as exc:
-            _finish_failure(exc)
-
-    try:
-        schedule_next_reanalysis()
-    except Exception as exc:
-        _finish_failure(exc)
+    task = _ExportTask(bv, cfg, function_keys)
+    task.start()
 
 
 def register_plugin() -> None:
