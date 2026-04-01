@@ -138,35 +138,70 @@ def export_for_ai(bv: object) -> None:
         _show_failure(exc)
         return
 
-    state = {"index": 0, "retry_count": 0}
+    state = {"index": 0, "retry_count": 0, "event": None, "closed": False}
+
+    def _remove_pending_event(event: object | None) -> None:
+        if event in _PENDING_EXPORT_EVENTS:
+            _PENDING_EXPORT_EVENTS.remove(event)
+
+    def _finish_success() -> None:
+        if state["closed"]:
+            return
+        state["closed"] = True
+        _remove_pending_event(state["event"])
+        state["event"] = None
+        summary = finalize_export_session(session, bv)
+        task.finish()
+        execute_on_main_thread(lambda summary=summary: _show_completion(summary))
+
+    def _finish_failure(exc: Exception) -> None:
+        if state["closed"]:
+            return
+        state["closed"] = True
+        _remove_pending_event(state["event"])
+        state["event"] = None
+        log_error(f"Binja-NO-MCP export failed: {exc}")
+        task.finish()
+        execute_on_main_thread(lambda exc=exc: _show_failure(exc))
+
+    def _wait_for_analysis(progress: str) -> None:
+        if state["closed"]:
+            return
+        task.progress = progress
+        event = bv.add_analysis_completion_event(completion_callback)
+        state["event"] = event
+        _PENDING_EXPORT_EVENTS.append(event)
+        bv.update_analysis()
 
     def schedule_next_reanalysis() -> None:
         index = state["index"]
         if index >= len(function_keys):
-            summary = finalize_export_session(session, bv)
-            task.finish()
-            execute_on_main_thread(lambda summary=summary: _show_completion(summary))
-            if event in _PENDING_EXPORT_EVENTS:
-                _PENDING_EXPORT_EVENTS.remove(event)
+            _finish_success()
             return
 
         function_key = function_keys[index]
-        task.progress = f"Reanalyzing function {index + 1}/{len(function_keys)}"
         _request_function_reanalysis(bv, [function_key])
-        bv.update_analysis()
+        _wait_for_analysis(f"Reanalyzing function {index + 1}/{len(function_keys)}")
 
     def completion_callback() -> None:
+        current_event = state["event"]
+        state["event"] = None
+        _remove_pending_event(current_event)
+
+        if state["closed"]:
+            return
+
         try:
             index = state["index"]
             if index >= len(function_keys):
+                _finish_success()
                 return
 
             function_key = function_keys[index]
             func = resolve_recognized_functions(bv, [function_key])
             if func and getattr(func[0], "needs_update", False) and state["retry_count"] < 3:
                 state["retry_count"] += 1
-                task.progress = f"Waiting for function {index + 1}/{len(function_keys)} analysis to settle"
-                bv.update_analysis()
+                _wait_for_analysis(f"Waiting for function {index + 1}/{len(function_keys)} analysis to settle")
                 return
 
             task.progress = f"Exporting function {index + 1}/{len(function_keys)}"
@@ -175,24 +210,12 @@ def export_for_ai(bv: object) -> None:
             state["retry_count"] = 0
             schedule_next_reanalysis()
         except Exception as exc:
-            log_error(f"Binja-NO-MCP export failed: {exc}")
-            execute_on_main_thread(lambda exc=exc: _show_failure(exc))
-            task.finish()
-            if event in _PENDING_EXPORT_EVENTS:
-                _PENDING_EXPORT_EVENTS.remove(event)
-            return
-
-    event = bv.add_analysis_completion_event(completion_callback)
-    _PENDING_EXPORT_EVENTS.append(event)
+            _finish_failure(exc)
 
     try:
         schedule_next_reanalysis()
     except Exception as exc:
-        task.finish()
-        if event in _PENDING_EXPORT_EVENTS:
-            _PENDING_EXPORT_EVENTS.remove(event)
-        log_error(f"Binja-NO-MCP export failed before scheduling: {exc}")
-        _show_failure(exc)
+        _finish_failure(exc)
 
 
 def register_plugin() -> None:
