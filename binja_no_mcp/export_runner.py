@@ -10,9 +10,9 @@ from .collectors import (
     collect_segment_records,
     collect_string_records,
     collect_symbol_records,
-    freeze_recognized_functions,
     function_declaration,
     function_identity,
+    resolve_recognized_functions,
 )
 from .config import ExportConfig
 from .exporters import prepare_output_tree, write_json, write_jsonl_records, write_text
@@ -208,11 +208,15 @@ def _export_llil(
     return llil_files
 
 
-def run_export(bv: object, cfg: ExportConfig) -> ExportSummary:
+def run_export(
+    bv: object,
+    cfg: ExportConfig,
+    function_keys: list[tuple[int, str | None]] | None = None,
+) -> ExportSummary:
     paths = ExportPaths.from_root(Path(cfg.output_dir))
     prepare_output_tree(paths, cfg.overwrite)
 
-    recognized_funcs = freeze_recognized_functions(bv)
+    recognized_funcs = resolve_recognized_functions(bv, function_keys)
     failures: list[dict[str, object]] = []
     function_errors: dict[int, list[str]] = {}
 

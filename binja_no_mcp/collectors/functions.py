@@ -4,6 +4,45 @@ from ..models import FunctionMeta
 from ..naming import sanitize_name
 
 
+def freeze_recognized_function_keys(bv: object) -> list[tuple[int, str | None]]:
+    result: list[tuple[int, str | None]] = []
+    for func in getattr(bv, "functions", []):
+        arch_name = getattr(getattr(func, "arch", None), "name", None)
+        result.append((int(getattr(func, "start", 0)), str(arch_name) if arch_name else None))
+    return sorted(result, key=lambda item: (item[0], item[1] or ""))
+
+
+def resolve_recognized_functions(
+    bv: object, function_keys: list[tuple[int, str | None]] | None = None
+) -> list[object]:
+    if function_keys is None:
+        return freeze_recognized_functions(bv)
+
+    get_functions_at = getattr(bv, "get_functions_at", None)
+    get_function_at = getattr(bv, "get_function_at", None)
+    resolved: list[object] = []
+    for start, arch_name in function_keys:
+        candidates: list[object] = []
+        if callable(get_functions_at):
+            candidates = list(get_functions_at(start))
+        elif callable(get_function_at):
+            func = get_function_at(start)
+            if func is not None:
+                candidates = [func]
+
+        if arch_name is not None:
+            match = next(
+                (func for func in candidates if getattr(getattr(func, "arch", None), "name", None) == arch_name),
+                None,
+            )
+        else:
+            match = candidates[0] if candidates else None
+
+        if match is not None:
+            resolved.append(match)
+    return resolved
+
+
 def freeze_recognized_functions(bv: object) -> list[object]:
     return sorted(list(getattr(bv, "functions", [])), key=lambda func: getattr(func, "start", 0))
 

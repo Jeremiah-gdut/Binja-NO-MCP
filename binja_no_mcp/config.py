@@ -8,6 +8,7 @@ from typing import Any
 @dataclass(frozen=True, slots=True)
 class ExportConfig:
     output_dir: Path
+    reanalyze_before_export: bool = True
     export_hlil: bool = True
     export_pseudoc: bool = False
     export_mlil: bool = False
