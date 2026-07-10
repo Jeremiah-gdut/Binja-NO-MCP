@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class ExportSummary:
+    status: str
     function_count: int
     hlil_exported: int
     pseudoc_exported: int
@@ -20,6 +21,7 @@ class ExportSummary:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "status": self.status,
             "function_count": self.function_count,
             "hlil_exported": self.hlil_exported,
             "pseudoc_exported": self.pseudoc_exported,

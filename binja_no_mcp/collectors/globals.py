@@ -15,11 +15,25 @@ def _type_name(value: object) -> str | None:
     return str(value)
 
 
-def collect_binary_metadata(bv: object, function_count: int) -> dict[str, object]:
+def collect_binary_metadata(
+    bv: object,
+    function_count: int,
+    *,
+    snapshot_status: str = "partial",
+    exported_function_count: int = 0,
+    failed_function_count: int = 0,
+) -> dict[str, object]:
     file_metadata = getattr(bv, "file", None)
     arch = getattr(bv, "arch", None)
     platform = getattr(bv, "platform", None)
     return {
+        "schema_version": 1,
+        "snapshot_status": snapshot_status,
+        "planned_function_count": function_count,
+        "exported_function_count": exported_function_count,
+        "failed_function_count": failed_function_count,
+        "function_index_file": "meta/function_index.jsonl",
+        "startup_entries_file": "meta/startup_entries.json",
         "filename": getattr(file_metadata, "filename", None),
         "view_type": getattr(bv, "view_type", None),
         "start": hex_addr(getattr(bv, "start", None)),

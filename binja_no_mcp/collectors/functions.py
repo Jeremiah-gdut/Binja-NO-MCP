@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ..models import FunctionMeta
-from ..naming import sanitize_name
+from ..naming import function_id, sanitize_name
 
 
 def freeze_recognized_function_keys(bv: object) -> list[tuple[int, str | None]]:
@@ -120,15 +120,6 @@ def _normalize_bool(value: object) -> bool | None:
     return bool(value)
 
 
-def _unique_function_addresses(funcs: object) -> list[int]:
-    addresses = {int(getattr(func, "start")) for func in funcs if getattr(func, "start", None) is not None}
-    return sorted(addresses)
-
-
-def _unique_addresses(addresses: object) -> list[int]:
-    return sorted({int(address) for address in addresses})
-
-
 def _enum_name(value: object) -> str | None:
     if value is None:
         return None
@@ -146,8 +137,7 @@ def _prototype_location(location: object | None) -> dict[str, object] | None:
     }
 
 
-def _prototype_for_function(func: object) -> tuple[str | None, dict[str, object]]:
-    declaration = function_declaration(func)
+def _prototype_for_function(func: object, declaration: str | None) -> tuple[str | None, dict[str, object]]:
     func_type = getattr(func, "type", None)
     if func_type is None:
         return declaration, {
@@ -182,6 +172,91 @@ def _prototype_for_function(func: object) -> tuple[str | None, dict[str, object]
     }
 
 
+def _operation_name(instruction: object) -> str:
+    operation = getattr(instruction, "operation", None)
+    return str(getattr(operation, "name", operation) or "")
+
+
+def _constant_target(expression: object) -> int | None:
+    value = getattr(expression, "constant", None)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _call_site_address(instruction: object) -> int | None:
+    value = getattr(instruction, "address", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _direct_il_evidence(func: object) -> list[dict[str, str]]:
+    try:
+        llil = getattr(func, "low_level_il", None)
+        instructions = getattr(llil, "instructions", []) if llil is not None else []
+    except Exception:
+        return []
+    evidence: list[dict[str, str]] = []
+    for instruction in instructions:
+        if _operation_name(instruction) not in {"LLIL_CALL", "LLIL_TAILCALL"}:
+            continue
+        call_site = _call_site_address(instruction)
+        if call_site is None:
+            continue
+        target = _constant_target(getattr(instruction, "dest", None))
+        if target is not None:
+            evidence.append(
+                {
+                    "source": "direct_il",
+                    "call_site": function_id(call_site),
+                    "target": function_id(target),
+                }
+            )
+        elif target is None:
+            evidence.append({"source": "unresolved_indirect", "call_site": function_id(call_site)})
+    return evidence
+
+
+def _bn_analysis_evidence(bv: object, func: object) -> list[dict[str, str]]:
+    get_callees = getattr(bv, "get_callees", None)
+    if not callable(get_callees):
+        return []
+    evidence: list[dict[str, str]] = []
+    try:
+        call_sites = getattr(func, "call_sites", []) or []
+    except Exception:
+        return []
+    for call_site in call_sites:
+        address = _call_site_address(call_site)
+        if address is None:
+            continue
+        try:
+            targets = get_callees(address, getattr(call_site, "function", func), getattr(call_site, "arch", None))
+        except Exception:
+            continue
+        for target in targets:
+            try:
+                evidence.append(
+                    {
+                        "source": "bn_analysis",
+                        "call_site": function_id(address),
+                        "target": function_id(int(target)),
+                    }
+                )
+            except (TypeError, ValueError):
+                continue
+    return evidence
+
+
+def collect_call_evidence(bv: object, func: object) -> list[dict[str, str]]:
+    return _direct_il_evidence(func) + _bn_analysis_evidence(bv, func)
+
+
 def build_function_meta(
     func: object,
     hlil_file: str | None,
@@ -189,12 +264,12 @@ def build_function_meta(
     mlil_file: str | None,
     mlil_ssa_file: str | None,
     llil_file: str | None,
+    declaration: str | None,
+    call_evidence: list[dict[str, str]],
     export_error: str | None = None,
 ) -> FunctionMeta:
     name, raw_name, sanitized_name = function_identity(func)
-    declaration, prototype = _prototype_for_function(func)
-    callers = _unique_function_addresses(getattr(func, "callers", []))
-    callees = _unique_addresses(getattr(func, "callee_addresses", []))
+    declaration, prototype = _prototype_for_function(func, declaration)
     calling_convention = getattr(func, "calling_convention", None)
     calling_convention_name = getattr(calling_convention, "name", None)
 
@@ -214,9 +289,6 @@ def build_function_meta(
         mlil_file=mlil_file,
         mlil_ssa_file=mlil_ssa_file,
         llil_file=llil_file,
-        caller_count=len(callers),
-        callee_count=len(callees),
-        callers=callers,
-        callees=callees,
+        call_evidence=call_evidence,
         export_error=export_error,
     )

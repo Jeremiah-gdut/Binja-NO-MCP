@@ -13,10 +13,7 @@ def prepare_output_tree(paths: ExportPaths, overwrite: bool) -> None:
         paths.meta_dir,
         paths.functions_dir,
         paths.data_dir,
-        paths.pseudoc_dir,
-        paths.mlil_dir,
-        paths.mlil_ssa_dir,
-        paths.llil_dir,
+        paths.optional_dir,
     ]
     if not overwrite and any(directory.exists() for directory in managed_dirs):
         raise FileExistsError(f"output tree already exists under {paths.root}")

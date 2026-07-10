@@ -6,11 +6,13 @@ from pathlib import Path
 from .collectors import (
     build_function_meta,
     collect_binary_metadata,
+    collect_call_evidence,
     collect_data_var_records,
     collect_section_records,
     collect_segment_records,
     collect_string_records,
     collect_symbol_records,
+    collect_startup_entries,
     function_declaration,
     function_identity,
     resolve_recognized_functions,
@@ -18,7 +20,7 @@ from .collectors import (
 from .config import ExportConfig
 from .exporters import prepare_output_tree, write_json, write_jsonl_records, write_text
 from .models import ExportSummary
-from .naming import function_file_stem
+from .naming import function_file_stem, function_id
 from .renderers import render_hlil, render_il_listing, render_pseudoc
 from .utils import ExportPaths
 
@@ -32,7 +34,10 @@ class ExportSession:
     paths: ExportPaths
     function_keys: list[FunctionKey]
     index_records: list[dict[str, object]] = field(default_factory=list)
+    indexed_starts: set[int] = field(default_factory=set)
     failures: list[dict[str, object]] = field(default_factory=list)
+    exported_function_count: int = 0
+    cancelled: bool = False
     hlil_exported: int = 0
     pseudoc_exported: int = 0
     mlil_exported: int = 0
@@ -46,7 +51,7 @@ class ExportSession:
 
 def _failure_record(start: int | None, name: str | None, phase: str, error: Exception | str) -> dict[str, object]:
     return {
-        "start": None if start is None else f"0x{start:016x}",
+        "start": None if start is None else function_id(start),
         "name": name,
         "phase": phase,
         "error": str(error),
@@ -55,6 +60,25 @@ def _failure_record(start: int | None, name: str | None, phase: str, error: Exce
 
 def _record_function_error(function_errors: list[str], phase: str, error: Exception | str) -> None:
     function_errors.append(f"{phase}: {error}")
+
+
+def _failed_index_record(start: int, name: str | None, error: Exception | str, status: str = "failed") -> dict[str, object]:
+    return {
+        "id": function_id(start),
+        "name": name,
+        "declaration": None,
+        "artifacts": {},
+        "export_status": status,
+        "export_error": str(error),
+        "startup_stages": [],
+    }
+
+
+def _append_index_record(session: ExportSession, start: int, record: dict[str, object]) -> None:
+    if start in session.indexed_starts:
+        return
+    session.indexed_starts.add(start)
+    session.index_records.append(record)
 
 
 def _export_global_records(session: ExportSession, bv: object) -> None:
@@ -103,7 +127,9 @@ def _resolve_one_function(bv: object, function_key: FunctionKey) -> object | Non
     return resolved[0] if resolved else None
 
 
-def _export_hlil_family_for_function(session: ExportSession, bv: object, func: object) -> tuple[str | None, str | None, list[str]]:
+def _export_hlil_family_for_function(
+    session: ExportSession, bv: object, func: object, declaration: str | None
+) -> tuple[str | None, str | None, list[str]]:
     hlil_file: str | None = None
     pseudoc_file: str | None = None
     errors: list[str] = []
@@ -112,9 +138,8 @@ def _export_hlil_family_for_function(session: ExportSession, bv: object, func: o
     if not (cfg.export_hlil or cfg.export_pseudoc):
         return hlil_file, pseudoc_file, errors
 
-    declaration = function_declaration(func)
-    name, raw_name, _ = function_identity(func)
-    stem = function_file_stem(func.start, raw_name)
+    name, _, _ = function_identity(func)
+    stem = function_file_stem(func.start)
     produced = False
 
     for hlil in bv.hlil_functions(function_generator=(item for item in [func])):
@@ -159,8 +184,8 @@ def _export_mlil_family_for_function(session: ExportSession, bv: object, func: o
     if not (cfg.export_mlil or cfg.export_mlil_ssa):
         return mlil_file, mlil_ssa_file, errors
 
-    name, raw_name, _ = function_identity(func)
-    stem = function_file_stem(func.start, raw_name)
+    name, _, _ = function_identity(func)
+    stem = function_file_stem(func.start)
     produced = False
 
     for mlil in bv.mlil_functions(function_generator=(item for item in [func])):
@@ -205,8 +230,8 @@ def _export_llil_for_function(session: ExportSession, func: object) -> tuple[str
     if not session.cfg.export_llil:
         return llil_file, errors
 
-    name, raw_name, _ = function_identity(func)
-    stem = function_file_stem(func.start, raw_name)
+    name, _, _ = function_identity(func)
+    stem = function_file_stem(func.start)
     try:
         llil = getattr(func, "low_level_il", None)
         if llil is None:
@@ -233,51 +258,106 @@ def export_function(session: ExportSession, bv: object, function_key: FunctionKe
     func = _resolve_one_function(bv, function_key)
     start, _ = function_key
     if func is None:
-        session.failures.append(_failure_record(start, None, "resolve", "Function disappeared before export"))
+        error = "Function disappeared before export"
+        session.failures.append(_failure_record(start, None, "resolve", error))
+        _append_index_record(session, start, _failed_index_record(start, None, error))
         return
     if getattr(func, "needs_update", False):
         name, _, _ = function_identity(func)
-        session.failures.append(
-            _failure_record(int(getattr(func, "start", start)), name, "analysis", "Function still needs analysis update")
-        )
+        error = "Function still needs analysis update"
+        session.failures.append(_failure_record(int(getattr(func, "start", start)), name, "analysis", error))
+        _append_index_record(session, start, _failed_index_record(start, name, error))
         return
 
-    function_errors: list[str] = []
-    hlil_file, pseudoc_file, hlil_errors = _export_hlil_family_for_function(session, bv, func)
-    function_errors.extend(hlil_errors)
-    mlil_file, mlil_ssa_file, mlil_errors = _export_mlil_family_for_function(session, bv, func)
-    function_errors.extend(mlil_errors)
-    llil_file, llil_errors = _export_llil_for_function(session, func)
-    function_errors.extend(llil_errors)
-
-    name, raw_name, _ = function_identity(func)
-    stem = function_file_stem(func.start, raw_name)
-    meta = build_function_meta(
-        func,
-        hlil_file=hlil_file,
-        pseudoc_file=pseudoc_file,
-        mlil_file=mlil_file,
-        mlil_ssa_file=mlil_ssa_file,
-        llil_file=llil_file,
-        export_error="; ".join(function_errors) if function_errors else None,
-    )
-    meta_name = f"{stem}.meta.json"
+    name, _, _ = function_identity(func)
     try:
+        declaration = function_declaration(func)
+        function_errors: list[str] = []
+        hlil_file, pseudoc_file, hlil_errors = _export_hlil_family_for_function(session, bv, func, declaration)
+        function_errors.extend(hlil_errors)
+        mlil_file, mlil_ssa_file, mlil_errors = _export_mlil_family_for_function(session, bv, func)
+        function_errors.extend(mlil_errors)
+        llil_file, llil_errors = _export_llil_for_function(session, func)
+        function_errors.extend(llil_errors)
+        meta = build_function_meta(
+            func,
+            hlil_file=hlil_file,
+            pseudoc_file=pseudoc_file,
+            mlil_file=mlil_file,
+            mlil_ssa_file=mlil_ssa_file,
+            llil_file=llil_file,
+            declaration=declaration,
+            call_evidence=collect_call_evidence(bv, func),
+            export_error="; ".join(function_errors) if function_errors else None,
+        )
+        meta_name = f"{function_file_stem(func.start)}.meta.json"
         write_json(session.paths.functions_dir / meta_name, meta.to_dict())
-        session.index_records.append(meta.to_index_record(meta_name))
+        _append_index_record(session, start, meta.to_index_record(meta_name))
         session.meta_exported += 1
+        if not function_errors:
+            session.exported_function_count += 1
     except Exception as exc:
-        session.failures.append(_failure_record(func.start, name, "meta", exc))
+        session.failures.append(_failure_record(func.start, name, "function", exc))
+        _append_index_record(session, start, _failed_index_record(start, name, exc))
+
+
+def _ensure_index_records(session: ExportSession) -> None:
+    status = "not_exported" if session.cancelled else "failed"
+    message = "Export cancelled before this function" if session.cancelled else "Function was not exported"
+    for start, _ in session.function_keys:
+        _append_index_record(session, start, _failed_index_record(start, None, message, status))
+
+
+def _snapshot_status(session: ExportSession) -> str:
+    if session.cancelled:
+        return "cancelled"
+    if session.exported_function_count == len(session.function_keys) and not session.failures:
+        return "complete"
+    return "partial"
+
+
+def _failed_function_count(session: ExportSession) -> int:
+    return sum(record.get("export_status") in {"failed", "partial"} for record in session.index_records)
+
+
+def _apply_startup_stages(session: ExportSession, entries: list[dict[str, str]]) -> None:
+    stages_by_id: dict[str, list[str]] = {}
+    for entry in entries:
+        stages_by_id.setdefault(entry["id"], []).append(entry["stage"])
+    for record in session.index_records:
+        record["startup_stages"] = stages_by_id.get(str(record["id"]), [])
 
 
 def finalize_export_session(session: ExportSession, bv: object) -> ExportSummary:
-    _export_global_records(session, bv)
-    write_json(session.paths.binary_meta_path, collect_binary_metadata(bv, len(session.function_keys)))
+    if not session.cancelled:
+        _export_global_records(session, bv)
+    _ensure_index_records(session)
+    try:
+        startup = collect_startup_entries(bv, {key[0] for key in session.function_keys})
+    except Exception as exc:
+        session.failures.append(_failure_record(None, None, "startup", exc))
+        startup = {"target_kind": "unknown", "entries": []}
+    entries = startup["entries"]
+    _apply_startup_stages(session, entries)
+    write_json(session.paths.startup_entries_path, startup)
     write_jsonl_records(session.paths.function_index_path, session.index_records)
     if session.cfg.write_failures:
         write_jsonl_records(session.paths.failures_path, session.failures)
 
+    status = _snapshot_status(session)
+    write_json(
+        session.paths.binary_meta_path,
+        collect_binary_metadata(
+            bv,
+            len(session.function_keys),
+            snapshot_status=status,
+            exported_function_count=session.exported_function_count,
+            failed_function_count=_failed_function_count(session),
+        ),
+    )
+
     return ExportSummary(
+        status=status,
         function_count=len(session.function_keys),
         hlil_exported=session.hlil_exported,
         pseudoc_exported=session.pseudoc_exported,

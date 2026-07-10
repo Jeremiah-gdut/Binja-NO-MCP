@@ -16,7 +16,7 @@ Current UI workflow:
 - preserves address comments from the current analysis view in exported linear HLIL / pseudo-C when available
 - lets you choose pseudo-C / MLIL / MLIL SSA / LLIL as optional exports in the UI
 - writes the function declaration into the exported HLIL header and `.meta.json`
-- always exports per-function metadata and global metadata
+- writes a current-snapshot header, startup entries, and a compact function index
 
 ## Output Layout
 
@@ -27,24 +27,25 @@ binja-no-mcp-export/
     export_config.json
     failures.jsonl
     function_index.jsonl
+    startup_entries.json
     sections.json
     segments.json
   functions/
-    0000000000088504_sub_88504.hlil.txt
-    0000000000088504_sub_88504.meta.json
+    0x88504.hlil.txt
+    0x88504.meta.json
   data/
     strings.jsonl
     data_vars.jsonl
     symbols.jsonl
   optional/
     pseudoc/
-      0000000000088504_sub_88504.pseudoc.c
+      0x88504.pseudoc.c
     mlil/
-      0000000000088504_sub_88504.mlil.txt
+      0x88504.mlil.txt
     mlil_ssa/
-      0000000000088504_sub_88504.mlil_ssa.txt
+      0x88504.mlil_ssa.txt
     llil/
-      0000000000088504_sub_88504.llil.txt
+      0x88504.llil.txt
 ```
 
 ## UI Usage
@@ -67,6 +68,7 @@ Always exported:
 
 - `*.meta.json`
 - `meta/function_index.jsonl`
+- `meta/startup_entries.json`
 - `meta/failures.jsonl`
 - `meta/binary.json`
 - `meta/export_config.json`
@@ -75,6 +77,8 @@ Always exported:
 - `data/strings.jsonl`
 - `data/data_vars.jsonl`
 - `data/symbols.jsonl`
+
+`meta/binary.json` is the snapshot header. Read it first for schema, status, and function counts; then read startup entries and the function index. A new export replaces the previous snapshot.
 
 ## Notes
 

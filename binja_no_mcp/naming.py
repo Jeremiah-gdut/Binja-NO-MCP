@@ -19,8 +19,12 @@ def sanitize_name(name: str, max_len: int = 80) -> str:
     return sanitized
 
 
-def function_file_stem(start: int, name: str) -> str:
-    return f"{start:016x}_{sanitize_name(name)}"
+def function_id(start: int) -> str:
+    return f"0x{start:x}"
+
+
+def function_file_stem(start: int) -> str:
+    return function_id(start)
 
 
 def hex_addr(value: int | None) -> str | None:

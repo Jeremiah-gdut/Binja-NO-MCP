@@ -43,6 +43,10 @@ class ExportPaths:
         return self.meta_dir / "function_index.jsonl"
 
     @property
+    def startup_entries_path(self) -> Path:
+        return self.meta_dir / "startup_entries.json"
+
+    @property
     def failures_path(self) -> Path:
         return self.meta_dir / "failures.jsonl"
 
