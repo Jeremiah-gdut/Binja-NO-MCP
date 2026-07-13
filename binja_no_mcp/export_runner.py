@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import monotonic
+from typing import Callable
 
 from .collectors import (
     build_function_meta,
@@ -22,6 +24,7 @@ from .exporters import prepare_output_tree, write_json, write_jsonl_records, wri
 from .models import ExportSummary
 from .naming import function_file_stem, function_id
 from .renderers import render_hlil, render_il_listing, render_pseudoc
+from .resource_monitor import ProcessMemoryMonitor
 from .utils import ExportPaths
 
 
@@ -47,23 +50,49 @@ class ExportSession:
     strings_exported: int = 0
     data_vars_exported: int = 0
     symbols_exported: int = 0
+    memory_monitor: ProcessMemoryMonitor | None = None
+    memory_window_active: bool = False
+    stop_requested: bool = False
 
 
-def _failure_record(start: int | None, name: str | None, phase: str, error: Exception | str) -> dict[str, object]:
-    return {
+def _failure_record(
+    start: int | None,
+    name: str | None,
+    phase: str,
+    error: Exception | str,
+    *,
+    reason: str | None = None,
+    elapsed_seconds: float | None = None,
+    memory_window: dict[str, object] | None = None,
+) -> dict[str, object]:
+    record: dict[str, object] = {
         "start": None if start is None else function_id(start),
         "name": name,
         "phase": phase,
         "error": str(error),
     }
+    if reason is not None:
+        record["reason"] = reason
+    if elapsed_seconds is not None:
+        record["elapsed_seconds"] = elapsed_seconds
+    if memory_window is not None:
+        record["memory_window"] = memory_window
+    return record
 
 
 def _record_function_error(function_errors: list[str], phase: str, error: Exception | str) -> None:
     function_errors.append(f"{phase}: {error}")
 
 
-def _failed_index_record(start: int, name: str | None, error: Exception | str, status: str = "failed") -> dict[str, object]:
-    return {
+def _failed_index_record(
+    start: int,
+    name: str | None,
+    error: Exception | str,
+    status: str = "failed",
+    *,
+    memory_window: dict[str, object] | None = None,
+) -> dict[str, object]:
+    record: dict[str, object] = {
         "id": function_id(start),
         "name": name,
         "declaration": None,
@@ -72,6 +101,74 @@ def _failed_index_record(start: int, name: str | None, error: Exception | str, s
         "export_error": str(error),
         "startup_stages": [],
     }
+    if memory_window is not None:
+        record["memory_window"] = memory_window
+    return record
+
+
+def _partial_index_record(
+    start: int,
+    name: str,
+    declaration: str | None,
+    hlil_file: str | None,
+    pseudoc_file: str | None,
+    mlil_file: str | None,
+    mlil_ssa_file: str | None,
+    llil_file: str | None,
+    error: str,
+    *,
+    memory_window: dict[str, object] | None = None,
+) -> dict[str, object]:
+    artifacts: dict[str, str] = {}
+    if hlil_file:
+        artifacts["hlil"] = f"functions/{hlil_file}"
+    if pseudoc_file:
+        artifacts["pseudoc"] = f"optional/pseudoc/{pseudoc_file}"
+    if mlil_file:
+        artifacts["mlil"] = f"optional/mlil/{mlil_file}"
+    if mlil_ssa_file:
+        artifacts["mlil_ssa"] = f"optional/mlil_ssa/{mlil_ssa_file}"
+    if llil_file:
+        artifacts["llil"] = f"optional/llil/{llil_file}"
+    record: dict[str, object] = {
+        "id": function_id(start),
+        "name": name,
+        "declaration": declaration,
+        "artifacts": artifacts,
+        "export_status": "partial",
+        "export_error": error,
+        "startup_stages": [],
+    }
+    if memory_window is not None:
+        record["memory_window"] = memory_window
+    return record
+
+
+def _export_timed_out(deadline: float) -> bool:
+    return monotonic() >= deadline
+
+
+def _memory_ceiling_reached(session: ExportSession) -> bool:
+    return session.memory_monitor is not None and session.memory_monitor.exceeded
+
+
+def _export_cancelled(is_cancelled: Callable[[], bool] | None) -> bool:
+    return is_cancelled is not None and is_cancelled()
+
+
+def begin_memory_window(session: ExportSession) -> None:
+    if session.memory_monitor is None or session.memory_window_active:
+        return
+    session.memory_monitor.begin_window()
+    session.memory_window_active = True
+
+
+def _end_memory_window(session: ExportSession) -> dict[str, object] | None:
+    if session.memory_monitor is None or not session.memory_window_active:
+        return None
+    memory_window = session.memory_monitor.end_window().to_dict()
+    session.memory_window_active = False
+    return memory_window
 
 
 def _append_index_record(session: ExportSession, start: int, record: dict[str, object]) -> None:
@@ -81,21 +178,278 @@ def _append_index_record(session: ExportSession, start: int, record: dict[str, o
     session.index_records.append(record)
 
 
+def record_function_analysis_failure(
+    session: ExportSession,
+    function_key: FunctionKey,
+    func: object,
+    reason: str,
+    elapsed_seconds: float,
+) -> None:
+    """Record an unexportable function without risking stale analysis artifacts."""
+
+    start, _ = function_key
+    name, _, _ = function_identity(func)
+    message = {
+        "analysis-deferred": "Function analysis exceeded the configured time limit",
+        "analysis-unconfirmed": "Function analysis did not reach a confirmed workflow terminal state",
+        "skipped": "Function was skipped after a cooperative workflow halt request",
+    }.get(reason, "Function analysis did not complete")
+    memory_window = _end_memory_window(session)
+    session.failures.append(
+        _failure_record(
+            start,
+            name,
+            "analysis",
+            message,
+            reason=reason,
+            elapsed_seconds=elapsed_seconds,
+            memory_window=memory_window,
+        )
+    )
+    _append_index_record(session, start, _failed_index_record(start, name, message, memory_window=memory_window))
+
+
+def record_function_memory_ceiling(
+    session: ExportSession,
+    function_key: FunctionKey,
+    func: object,
+    elapsed_seconds: float,
+) -> None:
+    start, _ = function_key
+    name, _, _ = function_identity(func)
+    message = "Process PrivateUsage reached the configured memory ceiling"
+    memory_window = _end_memory_window(session)
+    session.failures.append(
+        _failure_record(
+            start,
+            name,
+            "memory",
+            message,
+            reason="memory-ceiling",
+            elapsed_seconds=elapsed_seconds,
+            memory_window=memory_window,
+        )
+    )
+    _append_index_record(session, start, _failed_index_record(start, name, message, memory_window=memory_window))
+    session.stop_requested = True
+
+
+def record_function_analysis_cancelled(
+    session: ExportSession,
+    function_key: FunctionKey,
+    func: object,
+    elapsed_seconds: float,
+) -> None:
+    start, _ = function_key
+    name, _, _ = function_identity(func)
+    message = "Export cancelled while waiting for function analysis"
+    memory_window = _end_memory_window(session)
+    session.failures.append(
+        _failure_record(
+            start,
+            name,
+            "analysis",
+            message,
+            reason="cancelled",
+            elapsed_seconds=elapsed_seconds,
+            memory_window=memory_window,
+        )
+    )
+    _append_index_record(
+        session,
+        start,
+        _failed_index_record(start, name, message, "partial", memory_window=memory_window),
+    )
+
+
+def _record_export_timeout(
+    session: ExportSession,
+    func: object,
+    start: int,
+    name: str,
+    declaration: str | None,
+    hlil_file: str | None,
+    pseudoc_file: str | None,
+    mlil_file: str | None,
+    mlil_ssa_file: str | None,
+    llil_file: str | None,
+    function_errors: list[str],
+    started_at: float,
+) -> None:
+    message = "Function export exceeded the configured time limit"
+    elapsed_seconds = monotonic() - started_at
+    memory_window = _end_memory_window(session)
+    _record_function_error(function_errors, "export-timeout", message)
+    session.failures.append(
+        _failure_record(
+            start,
+            name,
+            "export",
+            message,
+            reason="export-timeout",
+            elapsed_seconds=elapsed_seconds,
+            memory_window=memory_window,
+        )
+    )
+    _append_index_record(
+        session,
+        start,
+        _partial_index_record(
+            start,
+            name,
+            declaration,
+            hlil_file,
+            pseudoc_file,
+            mlil_file,
+            mlil_ssa_file,
+            llil_file,
+            "; ".join(function_errors),
+            memory_window=memory_window,
+        ),
+    )
+
+
+def _record_export_cancelled(
+    session: ExportSession,
+    start: int,
+    name: str,
+    declaration: str | None,
+    hlil_file: str | None,
+    pseudoc_file: str | None,
+    mlil_file: str | None,
+    mlil_ssa_file: str | None,
+    llil_file: str | None,
+    function_errors: list[str],
+    started_at: float,
+) -> None:
+    message = "Export cancelled by the user"
+    _record_function_error(function_errors, "cancelled", message)
+    memory_window = _end_memory_window(session)
+    session.failures.append(
+        _failure_record(
+            start,
+            name,
+            "export",
+            message,
+            reason="cancelled",
+            elapsed_seconds=monotonic() - started_at,
+            memory_window=memory_window,
+        )
+    )
+    _append_index_record(
+        session,
+        start,
+        _partial_index_record(
+            start,
+            name,
+            declaration,
+            hlil_file,
+            pseudoc_file,
+            mlil_file,
+            mlil_ssa_file,
+            llil_file,
+            "; ".join(function_errors),
+            memory_window=memory_window,
+        ),
+    )
+    session.cancelled = True
+
+
+def _record_memory_ceiling(
+    session: ExportSession,
+    func: object,
+    start: int,
+    name: str,
+    declaration: str | None,
+    hlil_file: str | None,
+    pseudoc_file: str | None,
+    mlil_file: str | None,
+    mlil_ssa_file: str | None,
+    llil_file: str | None,
+    function_errors: list[str],
+    started_at: float,
+    memory_window: dict[str, object] | None = None,
+) -> None:
+    message = "Process PrivateUsage reached the configured memory ceiling"
+    _record_function_error(function_errors, "memory-ceiling", message)
+    if memory_window is None:
+        memory_window = _end_memory_window(session)
+    session.failures.append(
+        _failure_record(
+            start,
+            name,
+            "memory",
+            message,
+            reason="memory-ceiling",
+            elapsed_seconds=monotonic() - started_at,
+            memory_window=memory_window,
+        )
+    )
+    _append_index_record(
+        session,
+        start,
+        _partial_index_record(
+            start,
+            name,
+            declaration,
+            hlil_file,
+            pseudoc_file,
+            mlil_file,
+            mlil_ssa_file,
+            llil_file,
+            "; ".join(function_errors),
+            memory_window=memory_window,
+        ),
+    )
+    session.stop_requested = True
+
+
+def _record_session_memory_ceiling(session: ExportSession) -> None:
+    memory_window = _end_memory_window(session)
+    session.failures.append(
+        _failure_record(
+            None,
+            None,
+            "memory",
+            "Process PrivateUsage reached the configured memory ceiling",
+            reason="memory-ceiling",
+            memory_window=memory_window,
+        )
+    )
+    session.stop_requested = True
+
+
+def stop_for_memory_ceiling(session: ExportSession) -> bool:
+    if session.stop_requested:
+        return True
+    if not _memory_ceiling_reached(session):
+        return False
+    _record_session_memory_ceiling(session)
+    return True
+
+
 def _export_global_records(session: ExportSession, bv: object) -> None:
     cfg = session.cfg
     paths = session.paths
+    begin_memory_window(session)
+    if stop_for_memory_ceiling(session):
+        return
 
     if cfg.export_sections:
         try:
             write_json(paths.sections_path, collect_section_records(bv))
         except Exception as exc:
             session.failures.append(_failure_record(None, None, "sections", exc))
+        if stop_for_memory_ceiling(session):
+            return
 
     if cfg.export_segments:
         try:
             write_json(paths.segments_path, collect_segment_records(bv))
         except Exception as exc:
             session.failures.append(_failure_record(None, None, "segments", exc))
+        if stop_for_memory_ceiling(session):
+            return
 
     if cfg.export_strings:
         try:
@@ -104,6 +458,8 @@ def _export_global_records(session: ExportSession, bv: object) -> None:
             session.strings_exported = len(string_records)
         except Exception as exc:
             session.failures.append(_failure_record(None, None, "strings", exc))
+        if stop_for_memory_ceiling(session):
+            return
 
     if cfg.export_data_vars:
         try:
@@ -112,6 +468,8 @@ def _export_global_records(session: ExportSession, bv: object) -> None:
             session.data_vars_exported = len(data_var_records)
         except Exception as exc:
             session.failures.append(_failure_record(None, None, "data_vars", exc))
+        if stop_for_memory_ceiling(session):
+            return
 
     if cfg.export_symbols:
         try:
@@ -120,6 +478,10 @@ def _export_global_records(session: ExportSession, bv: object) -> None:
             session.symbols_exported = len(symbol_records)
         except Exception as exc:
             session.failures.append(_failure_record(None, None, "symbols", exc))
+        if stop_for_memory_ceiling(session):
+            return
+
+    _end_memory_window(session)
 
 
 def _resolve_one_function(bv: object, function_key: FunctionKey) -> object | None:
@@ -128,15 +490,22 @@ def _resolve_one_function(bv: object, function_key: FunctionKey) -> object | Non
 
 
 def _export_hlil_family_for_function(
-    session: ExportSession, bv: object, func: object, declaration: str | None
-) -> tuple[str | None, str | None, list[str]]:
+    session: ExportSession,
+    bv: object,
+    func: object,
+    declaration: str | None,
+    deadline: float,
+    is_cancelled: Callable[[], bool] | None,
+) -> tuple[str | None, str | None, list[str], bool]:
     hlil_file: str | None = None
     pseudoc_file: str | None = None
     errors: list[str] = []
     cfg = session.cfg
 
     if not (cfg.export_hlil or cfg.export_pseudoc):
-        return hlil_file, pseudoc_file, errors
+        return hlil_file, pseudoc_file, errors, False
+    if _export_cancelled(is_cancelled) or _export_timed_out(deadline) or _memory_ceiling_reached(session):
+        return hlil_file, pseudoc_file, errors, True
 
     name, _, _ = function_identity(func)
     stem = function_file_stem(func.start)
@@ -152,6 +521,8 @@ def _export_hlil_family_for_function(
             except Exception as exc:
                 _record_function_error(errors, "hlil", exc)
                 session.failures.append(_failure_record(func.start, name, "hlil", exc))
+            if _export_cancelled(is_cancelled) or _export_timed_out(deadline) or _memory_ceiling_reached(session):
+                return hlil_file, pseudoc_file, errors, True
         if cfg.export_pseudoc:
             try:
                 pseudoc_file = f"{stem}.pseudoc.c"
@@ -160,6 +531,8 @@ def _export_hlil_family_for_function(
             except Exception as exc:
                 _record_function_error(errors, "pseudoc", exc)
                 session.failures.append(_failure_record(func.start, name, "pseudoc", exc))
+            if _export_cancelled(is_cancelled) or _export_timed_out(deadline) or _memory_ceiling_reached(session):
+                return hlil_file, pseudoc_file, errors, True
         break
 
     if not produced:
@@ -172,17 +545,26 @@ def _export_hlil_family_for_function(
             _record_function_error(errors, "pseudoc", message)
             session.failures.append(_failure_record(func.start, name, "pseudoc", message))
 
-    return hlil_file, pseudoc_file, errors
+    return (
+        hlil_file,
+        pseudoc_file,
+        errors,
+        _export_cancelled(is_cancelled) or _export_timed_out(deadline) or _memory_ceiling_reached(session),
+    )
 
 
-def _export_mlil_family_for_function(session: ExportSession, bv: object, func: object) -> tuple[str | None, str | None, list[str]]:
+def _export_mlil_family_for_function(
+    session: ExportSession, bv: object, func: object, deadline: float, is_cancelled: Callable[[], bool] | None
+) -> tuple[str | None, str | None, list[str], bool]:
     mlil_file: str | None = None
     mlil_ssa_file: str | None = None
     errors: list[str] = []
     cfg = session.cfg
 
     if not (cfg.export_mlil or cfg.export_mlil_ssa):
-        return mlil_file, mlil_ssa_file, errors
+        return mlil_file, mlil_ssa_file, errors, False
+    if _export_cancelled(is_cancelled) or _export_timed_out(deadline) or _memory_ceiling_reached(session):
+        return mlil_file, mlil_ssa_file, errors, True
 
     name, _, _ = function_identity(func)
     stem = function_file_stem(func.start)
@@ -198,6 +580,8 @@ def _export_mlil_family_for_function(session: ExportSession, bv: object, func: o
             except Exception as exc:
                 _record_function_error(errors, "mlil", exc)
                 session.failures.append(_failure_record(func.start, name, "mlil", exc))
+            if _export_cancelled(is_cancelled) or _export_timed_out(deadline) or _memory_ceiling_reached(session):
+                return mlil_file, mlil_ssa_file, errors, True
         if cfg.export_mlil_ssa:
             try:
                 ssa_form = getattr(mlil, "ssa_form", None)
@@ -209,6 +593,8 @@ def _export_mlil_family_for_function(session: ExportSession, bv: object, func: o
             except Exception as exc:
                 _record_function_error(errors, "mlil_ssa", exc)
                 session.failures.append(_failure_record(func.start, name, "mlil_ssa", exc))
+            if _export_cancelled(is_cancelled) or _export_timed_out(deadline) or _memory_ceiling_reached(session):
+                return mlil_file, mlil_ssa_file, errors, True
         break
 
     if not produced:
@@ -221,14 +607,23 @@ def _export_mlil_family_for_function(session: ExportSession, bv: object, func: o
             _record_function_error(errors, "mlil_ssa", message)
             session.failures.append(_failure_record(func.start, name, "mlil_ssa", message))
 
-    return mlil_file, mlil_ssa_file, errors
+    return (
+        mlil_file,
+        mlil_ssa_file,
+        errors,
+        _export_cancelled(is_cancelled) or _export_timed_out(deadline) or _memory_ceiling_reached(session),
+    )
 
 
-def _export_llil_for_function(session: ExportSession, func: object) -> tuple[str | None, list[str]]:
+def _export_llil_for_function(
+    session: ExportSession, func: object, deadline: float, is_cancelled: Callable[[], bool] | None
+) -> tuple[str | None, list[str], bool]:
     llil_file: str | None = None
     errors: list[str] = []
     if not session.cfg.export_llil:
-        return llil_file, errors
+        return llil_file, errors, False
+    if _export_cancelled(is_cancelled) or _export_timed_out(deadline) or _memory_ceiling_reached(session):
+        return llil_file, errors, True
 
     name, _, _ = function_identity(func)
     stem = function_file_stem(func.start)
@@ -242,43 +637,152 @@ def _export_llil_for_function(session: ExportSession, func: object) -> tuple[str
     except Exception as exc:
         _record_function_error(errors, "llil", exc)
         session.failures.append(_failure_record(func.start, name, "llil", exc))
-    return llil_file, errors
+    return (
+        llil_file,
+        errors,
+        _export_cancelled(is_cancelled) or _export_timed_out(deadline) or _memory_ceiling_reached(session),
+    )
 
 
 def prepare_export_session(bv: object, cfg: ExportConfig, function_keys: list[FunctionKey]) -> ExportSession:
     paths = ExportPaths.from_root(Path(cfg.output_dir))
     prepare_output_tree(paths, cfg.overwrite)
-    session = ExportSession(cfg=cfg, paths=paths, function_keys=function_keys)
-    write_json(paths.export_config_path, cfg.to_dict())
-    write_json(paths.binary_meta_path, collect_binary_metadata(bv, len(function_keys)))
-    return session
+    memory_monitor = ProcessMemoryMonitor(cfg.private_memory_limit_gib * 1024**3)
+    memory_monitor.start()
+    try:
+        session = ExportSession(cfg=cfg, paths=paths, function_keys=function_keys, memory_monitor=memory_monitor)
+        write_json(paths.export_config_path, cfg.to_dict())
+        write_json(paths.binary_meta_path, collect_binary_metadata(bv, len(function_keys)))
+        return session
+    except Exception:
+        memory_monitor.stop()
+        raise
 
 
-def export_function(session: ExportSession, bv: object, function_key: FunctionKey) -> None:
+def export_function(
+    session: ExportSession,
+    bv: object,
+    function_key: FunctionKey,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> None:
+    if session.stop_requested:
+        return
+    begin_memory_window(session)
+    if stop_for_memory_ceiling(session):
+        return
     func = _resolve_one_function(bv, function_key)
     start, _ = function_key
     if func is None:
         error = "Function disappeared before export"
-        session.failures.append(_failure_record(start, None, "resolve", error))
-        _append_index_record(session, start, _failed_index_record(start, None, error))
+        memory_window = _end_memory_window(session)
+        session.failures.append(_failure_record(start, None, "resolve", error, memory_window=memory_window))
+        _append_index_record(session, start, _failed_index_record(start, None, error, memory_window=memory_window))
         return
     if getattr(func, "needs_update", False):
         name, _, _ = function_identity(func)
         error = "Function still needs analysis update"
-        session.failures.append(_failure_record(int(getattr(func, "start", start)), name, "analysis", error))
-        _append_index_record(session, start, _failed_index_record(start, name, error))
+        memory_window = _end_memory_window(session)
+        session.failures.append(
+            _failure_record(int(getattr(func, "start", start)), name, "analysis", error, memory_window=memory_window)
+        )
+        _append_index_record(session, start, _failed_index_record(start, name, error, memory_window=memory_window))
         return
 
     name, _, _ = function_identity(func)
+    started_at = monotonic()
+    deadline = started_at + session.cfg.function_time_limit_seconds
+    declaration: str | None = None
+    hlil_file: str | None = None
+    pseudoc_file: str | None = None
+    mlil_file: str | None = None
+    mlil_ssa_file: str | None = None
+    llil_file: str | None = None
+    function_errors: list[str] = []
+
+    def record_timeout() -> None:
+        _record_export_timeout(
+            session,
+            func,
+            start,
+            name,
+            declaration,
+            hlil_file,
+            pseudoc_file,
+            mlil_file,
+            mlil_ssa_file,
+            llil_file,
+            function_errors,
+            started_at,
+        )
+
+    def record_memory_ceiling() -> None:
+        _record_memory_ceiling(
+            session,
+            func,
+            start,
+            name,
+            declaration,
+            hlil_file,
+            pseudoc_file,
+            mlil_file,
+            mlil_ssa_file,
+            llil_file,
+            function_errors,
+            started_at,
+        )
+
+    def record_cancellation() -> None:
+        _record_export_cancelled(
+            session,
+            start,
+            name,
+            declaration,
+            hlil_file,
+            pseudoc_file,
+            mlil_file,
+            mlil_ssa_file,
+            llil_file,
+            function_errors,
+            started_at,
+        )
+
+    def should_stop_at_boundary() -> bool:
+        if _export_cancelled(is_cancelled):
+            record_cancellation()
+            return True
+        if _memory_ceiling_reached(session):
+            record_memory_ceiling()
+            return True
+        if _export_timed_out(deadline):
+            record_timeout()
+            return True
+        return False
+
     try:
+        if should_stop_at_boundary():
+            return
         declaration = function_declaration(func)
-        function_errors: list[str] = []
-        hlil_file, pseudoc_file, hlil_errors = _export_hlil_family_for_function(session, bv, func, declaration)
+        if should_stop_at_boundary():
+            return
+        hlil_file, pseudoc_file, hlil_errors, _ = _export_hlil_family_for_function(
+            session, bv, func, declaration, deadline, is_cancelled
+        )
         function_errors.extend(hlil_errors)
-        mlil_file, mlil_ssa_file, mlil_errors = _export_mlil_family_for_function(session, bv, func)
+        if should_stop_at_boundary():
+            return
+        mlil_file, mlil_ssa_file, mlil_errors, _ = _export_mlil_family_for_function(
+            session, bv, func, deadline, is_cancelled
+        )
         function_errors.extend(mlil_errors)
-        llil_file, llil_errors = _export_llil_for_function(session, func)
+        if should_stop_at_boundary():
+            return
+        llil_file, llil_errors, _ = _export_llil_for_function(session, func, deadline, is_cancelled)
         function_errors.extend(llil_errors)
+        if should_stop_at_boundary():
+            return
+        call_evidence = collect_call_evidence(bv, func)
+        if should_stop_at_boundary():
+            return
         meta = build_function_meta(
             func,
             hlil_file=hlil_file,
@@ -287,18 +791,27 @@ def export_function(session: ExportSession, bv: object, function_key: FunctionKe
             mlil_ssa_file=mlil_ssa_file,
             llil_file=llil_file,
             declaration=declaration,
-            call_evidence=collect_call_evidence(bv, func),
+            call_evidence=call_evidence,
             export_error="; ".join(function_errors) if function_errors else None,
         )
+        if should_stop_at_boundary():
+            return
         meta_name = f"{function_file_stem(func.start)}.meta.json"
         write_json(session.paths.functions_dir / meta_name, meta.to_dict())
-        _append_index_record(session, start, meta.to_index_record(meta_name))
+        if should_stop_at_boundary():
+            return
+        memory_window = _end_memory_window(session)
+        index_record = meta.to_index_record(meta_name)
+        if memory_window is not None:
+            index_record["memory_window"] = memory_window
+        _append_index_record(session, start, index_record)
         session.meta_exported += 1
         if not function_errors:
             session.exported_function_count += 1
     except Exception as exc:
-        session.failures.append(_failure_record(func.start, name, "function", exc))
-        _append_index_record(session, start, _failed_index_record(start, name, exc))
+        memory_window = _end_memory_window(session)
+        session.failures.append(_failure_record(func.start, name, "function", exc, memory_window=memory_window))
+        _append_index_record(session, start, _failed_index_record(start, name, exc, memory_window=memory_window))
 
 
 def _ensure_index_records(session: ExportSession) -> None:
@@ -329,14 +842,26 @@ def _apply_startup_stages(session: ExportSession, entries: list[dict[str, str]])
 
 
 def finalize_export_session(session: ExportSession, bv: object) -> ExportSummary:
-    if not session.cancelled:
+    try:
+        return _finalize_export_session(session, bv)
+    finally:
+        _end_memory_window(session)
+        if session.memory_monitor is not None:
+            session.memory_monitor.stop()
+
+
+def _finalize_export_session(session: ExportSession, bv: object) -> ExportSummary:
+    if not session.cancelled and not session.stop_requested:
         _export_global_records(session, bv)
     _ensure_index_records(session)
-    try:
-        startup = collect_startup_entries(bv, {key[0] for key in session.function_keys})
-    except Exception as exc:
-        session.failures.append(_failure_record(None, None, "startup", exc))
+    if session.stop_requested:
         startup = {"target_kind": "unknown", "entries": []}
+    else:
+        try:
+            startup = collect_startup_entries(bv, {key[0] for key in session.function_keys})
+        except Exception as exc:
+            session.failures.append(_failure_record(None, None, "startup", exc))
+            startup = {"target_kind": "unknown", "entries": []}
     entries = startup["entries"]
     _apply_startup_stages(session, entries)
     write_json(session.paths.startup_entries_path, startup)
@@ -387,5 +912,9 @@ def run_export(
 
     session = prepare_export_session(bv, cfg, function_keys)
     for function_key in function_keys:
+        if stop_for_memory_ceiling(session):
+            break
         export_function(session, bv, function_key)
+        if session.stop_requested:
+            break
     return finalize_export_session(session, bv)

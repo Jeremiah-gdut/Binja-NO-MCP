@@ -22,12 +22,18 @@ class ExportConfig:
     batch_size: int = 64
     overwrite: bool = True
     write_failures: bool = True
+    function_time_limit_seconds: int = 900
+    private_memory_limit_gib: int = 24
 
     def __post_init__(self) -> None:
         output_dir = Path(self.output_dir).expanduser()
         object.__setattr__(self, "output_dir", output_dir)
         if self.batch_size < 1:
             raise ValueError("batch_size must be at least 1")
+        if self.function_time_limit_seconds < 1:
+            raise ValueError("function_time_limit_seconds must be at least 1")
+        if self.private_memory_limit_gib < 1:
+            raise ValueError("private_memory_limit_gib must be at least 1")
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
