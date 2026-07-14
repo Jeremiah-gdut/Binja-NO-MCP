@@ -7,7 +7,7 @@ Export the current Binary Ninja `BinaryView` into a stable on-disk tree for AI I
 
 Current UI workflow:
 
-- exports only `bv.functions`
+- exports function artifacts only for the function set frozen from `bv.functions`
 - keeps the exporter read-only
 - freezes the recognized function set before export scheduling
 - reanalyzes each frozen function and exports it immediately after its analysis completes by default
@@ -66,7 +66,7 @@ Defaults:
 - MLIL SSA: disabled
 - LLIL: disabled
 
-Always exported:
+Enabled by the default configuration:
 
 - `*.meta.json`
 - `meta/function_index.jsonl`
@@ -80,7 +80,7 @@ Always exported:
 - `data/data_vars.jsonl`
 - `data/symbols.jsonl`
 
-`meta/binary.json` is the snapshot header. Read it first for schema, status, and function counts; then read startup entries and the function index. A full export replaces the previous snapshot. Incremental export requires the same target snapshot, reuses only functions already marked exported with all selected artifacts present, and retries every other function.
+`meta/binary.json` is the snapshot header. Read it first for schema, status, and function counts. For open-ended program analysis, read startup entries next and query matching function-index records. A user-specified function can go directly to its index record; a pure metadata question can go directly to the relevant metadata artifact after the header. A full export replaces the previous snapshot. Incremental export requires the same target snapshot, reuses only functions already marked exported with all selected artifacts present, and retries every other function.
 
 ## Notes
 
@@ -88,6 +88,7 @@ Always exported:
 - The UI command serializes `reanalyze current function -> analysis completion -> export current function`.
 - `run_export` itself does not call `update_analysis_and_wait()`.
 - Optional pseudo-C / MLIL / MLIL SSA / LLIL exports are only generated when you explicitly enable them in the form.
+- Startup arrays are read from the relocation-applied BinaryView. Their nonzero slots retain order and duplicates even when Binary Ninja has no function artifact for an address.
 - Function artifact filenames use their sanitized Binary Ninja function names; unnamed functions use `sub_<offset>`.
 - The PrivateUsage ceiling is evaluated per function window: a crossing skips that function and then allows the next one to run.
 

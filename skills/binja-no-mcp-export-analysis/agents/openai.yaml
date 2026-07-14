@@ -1,0 +1,6 @@
+interface:
+  display_name: "Binja-no-mcp Export Analysis"
+  short_description: "Navigate Binja-NO-MCP export evidence"
+  default_prompt: "Use $binja-no-mcp-export-analysis to locate and interpret evidence in this export snapshot."
+policy:
+  allow_implicit_invocation: false
