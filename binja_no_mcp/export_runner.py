@@ -948,7 +948,7 @@ def _apply_startup_stages(session: ExportSession, entries: list[dict[str, str]])
     for entry in entries:
         stages_by_id.setdefault(entry["id"], []).append(entry["stage"])
     for record in session.index_records:
-        record["startup_stages"] = stages_by_id.get(str(record["id"]), [])
+        record["startup_stages"] = list(dict.fromkeys(stages_by_id.get(str(record["id"]), [])))
 
 
 def finalize_export_session(session: ExportSession, bv: object) -> ExportSummary:

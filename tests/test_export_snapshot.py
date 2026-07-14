@@ -73,9 +73,18 @@ class _RawView:
 
 
 class _BinaryView:
-    def __init__(self, functions: list[_Function], raw: bytes, entry_point: int) -> None:
+    def __init__(
+        self,
+        functions: list[_Function],
+        raw: bytes,
+        entry_point: int,
+        mapped: bytes | None = None,
+    ) -> None:
         self.functions = functions
         self.file = SimpleNamespace(filename="fixture.so", raw=_RawView(raw))
+        self._mapped = raw if mapped is None else mapped
+        elf_entry = struct.unpack_from("<Q", raw, 24)[0] if len(raw) >= 32 else 0
+        self._load_bias = entry_point - elf_entry if entry_point else 0
         self.arch = SimpleNamespace(name="aarch64")
         self.platform = None
         self.view_type = "ELF"
@@ -87,6 +96,12 @@ class _BinaryView:
         self.strings = []
         self.data_vars = {}
         self.symbols = {}
+
+    def read(self, address: int, length: int) -> bytes:
+        offset = address - self._load_bias
+        if offset < 0:
+            return b""
+        return self._mapped[offset : offset + length]
 
     def get_functions_at(self, start: int) -> list[_Function]:
         return [function for function in self.functions if function.start == start]
@@ -173,8 +188,9 @@ class ExportSnapshotTests(unittest.TestCase):
                 dynamic_entries=[(32, 0x300), (33, 8), (12, 0x1200), (25, 0x320), (27, 8)],
             )
         )
-        struct.pack_into("<Q", raw, 0x300, 0x1300)
-        struct.pack_into("<Q", raw, 0x320, 0x1400)
+        mapped = bytearray(raw)
+        struct.pack_into("<Q", mapped, 0x300, bias + 0x1300)
+        struct.pack_into("<Q", mapped, 0x320, bias + 0x1400)
         target = _Function(bias + 0x1200, "target")
         caller = _Function(
             bias + 0x1000,
@@ -189,7 +205,7 @@ class ExportSnapshotTests(unittest.TestCase):
         caller.call_sites = [SimpleNamespace(address=bias + 0x1010, function=caller, arch=caller.arch)]
         caller.bn_callees = {bias + 0x1010: [target.start]}
         constructors = [_Function(bias + value, f"init_{value:x}") for value in (0x1300, 0x1400)]
-        return _BinaryView([caller, target, *constructors], bytes(raw), caller.start)
+        return _BinaryView([caller, target, *constructors], bytes(raw), caller.start, bytes(mapped))
 
     def _startup_route(self, bv: _BinaryView) -> dict[str, object]:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -276,11 +292,13 @@ class ExportSnapshotTests(unittest.TestCase):
                 has_interp=True,
             )
         )
-        struct.pack_into("<Q", pie_raw, 0x300, 0x1300)
+        pie_mapped = bytearray(pie_raw)
+        struct.pack_into("<Q", pie_mapped, 0x300, 0x101300)
         pie = _BinaryView(
             [_Function(0x101000, "main"), _Function(0x101200, "init"), _Function(0x101300, "preinit")],
             bytes(pie_raw),
             0x101000,
+            bytes(pie_mapped),
         )
         pie_route = self._startup_route(pie)
         self.assertEqual(pie_route["target_kind"], "pie")
@@ -309,6 +327,44 @@ class ExportSnapshotTests(unittest.TestCase):
             0,
         )
         self.assertEqual(self._startup_route(non_target)["entries"], [])
+
+    def test_startup_route_keeps_relocated_entries_when_functions_are_unrecognized(self) -> None:
+        # Given a relocated mapped image whose raw startup arrays are still zero-filled.
+        bias = 0x100000
+        raw = _elf64(
+            elf_type=2,
+            entry=0x1000,
+            dynamic_entries=[(32, 0x300), (33, 8), (12, 0x1500), (25, 0x320), (27, 32)],
+        )
+        mapped = bytearray(raw)
+        struct.pack_into("<Q", mapped, 0x300, bias + 0x1300)
+        struct.pack_into("<QQQQ", mapped, 0x320, bias + 0x1400, 0, bias + 0x1400, bias + 0x1600)
+        bv = _BinaryView(
+            [_Function(bias + 0x1400, "recognized_ctor")],
+            raw,
+            bias + 0x1000,
+            bytes(mapped),
+        )
+
+        # When the public export workflow writes the snapshot.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "snapshot"
+            run_export(bv, ExportConfig(output_dir=output_dir))
+
+            # Then startup evidence keeps relocated values, unknown targets, order, and duplicate slots.
+            route = json.loads((output_dir / "meta" / "startup_entries.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                route["entries"],
+                [
+                    {"id": "0x101300", "stage": "preinit_array"},
+                    {"id": "0x101500", "stage": "init"},
+                    {"id": "0x101400", "stage": "init_array"},
+                    {"id": "0x101400", "stage": "init_array"},
+                    {"id": "0x101600", "stage": "init_array"},
+                    {"id": "0x101000", "stage": "elf_entry"},
+                ],
+            )
+            self.assertEqual(_index(output_dir)[0]["startup_stages"], ["init_array"])
 
     def test_bionic_main_requires_the_direct_crt_argument_pattern(self) -> None:
         raw = _elf64(elf_type=2, entry=0x1000, dynamic_entries=[])

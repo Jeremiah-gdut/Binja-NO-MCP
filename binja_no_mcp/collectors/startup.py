@@ -91,20 +91,13 @@ def _first_tag(tags: dict[int, list[int]], tag: int) -> int | None:
     return values[0] if values else None
 
 
-def _virtual_to_offset(load_segments: list[tuple[int, int, int]], address: int) -> int | None:
-    for vaddr, offset, size in load_segments:
-        if vaddr <= address < vaddr + size:
-            return offset + address - vaddr
-    return None
-
-
 def _read_array(bv: object, elf: dict[str, object], address: int | None, size: int | None) -> list[int]:
     if address is None or size is None or size <= 0 or size > 1 << 20:
         return []
-    offset = _virtual_to_offset(elf["load_segments"], address)
-    if offset is None:
+    read = getattr(bv, "read", None)
+    if not callable(read):
         return []
-    data = _read_raw(bv, offset, size)
+    data = bytes(read(_load_bias(bv, elf) + address, size))
     return [struct.unpack_from(f"{elf['endian']}Q", data, index)[0] for index in range(0, len(data) - 7, 8)]
 
 
@@ -205,19 +198,15 @@ def collect_startup_entries(bv: object, known_function_starts: set[int]) -> dict
     tags = elf["tags"]
     bias = _load_bias(bv, elf)
     entries: list[dict[str, str]] = []
-    seen: set[tuple[int, str]] = set()
 
     def add(address: int | None, stage: str) -> None:
-        if address is None:
+        if address is None or address == 0:
             return
         add_actual(bias + address, stage)
 
     def add_actual(actual_address: int | None, stage: str) -> None:
-        if actual_address is None:
+        if actual_address is None or actual_address == 0:
             return
-        if actual_address not in known_function_starts or (actual_address, stage) in seen:
-            return
-        seen.add((actual_address, stage))
         entries.append({"id": function_id(actual_address), "stage": stage})
 
     if target_kind in {"executable", "pie"}:
@@ -227,11 +216,11 @@ def collect_startup_entries(bv: object, known_function_starts: set[int]) -> dict
             _first_tag(tags, DT_PREINIT_ARRAY),
             _first_tag(tags, DT_PREINIT_ARRAYSZ),
         ):
-            add(address, "preinit_array")
+            add_actual(address, "preinit_array")
 
     add(_first_tag(tags, DT_INIT), "init")
     for address in _read_array(bv, elf, _first_tag(tags, DT_INIT_ARRAY), _first_tag(tags, DT_INIT_ARRAYSZ)):
-        add(address, "init_array")
+        add_actual(address, "init_array")
 
     functions = list(getattr(bv, "functions", []))
     if target_kind in {"executable", "pie"}:
