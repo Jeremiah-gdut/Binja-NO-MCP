@@ -97,6 +97,7 @@ class ProcessMemoryMonitor:
         with self._lock:
             self._baseline = self._latest
             self._peak = self._latest
+            self._exceeded = False
 
     def end_window(self) -> MemoryWindow:
         self._capture()
@@ -135,7 +136,10 @@ class ProcessMemoryMonitor:
             self._latest = sample
             if self._peak is None or sample.private_usage > self._peak.private_usage:
                 self._peak = sample
-            if sample.private_usage >= self._private_usage_limit_bytes:
+            if (
+                self._baseline is not None
+                and self._baseline.private_usage < self._private_usage_limit_bytes <= sample.private_usage
+            ):
                 self._exceeded = True
 
 

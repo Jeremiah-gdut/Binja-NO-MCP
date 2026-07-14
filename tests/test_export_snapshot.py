@@ -215,12 +215,12 @@ class ExportSnapshotTests(unittest.TestCase):
             main = next(record for record in records if record["id"] == "0x101000")
             self.assertEqual(main["declaration"], None)
             self.assertEqual(main["export_status"], "exported")
-            self.assertEqual(main["artifacts"]["hlil"], "functions/0x101000.hlil.txt")
+            self.assertEqual(main["artifacts"]["hlil"], "functions/main.hlil.txt")
             self.assertIn("elf_entry", main["startup_stages"])
             self.assertIn("main", main["startup_stages"])
             self.assertNotIn("call_evidence", main)
 
-            meta = json.loads((output_dir / "functions" / "0x101000.meta.json").read_text(encoding="utf-8"))
+            meta = json.loads((output_dir / "functions" / "main.meta.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["id"], "0x101000")
             self.assertIn(
                 {"source": "direct_il", "call_site": "0x101010", "target": "0x101200"},
@@ -253,7 +253,7 @@ class ExportSnapshotTests(unittest.TestCase):
             bv.functions[0].name = "renamed_main"
             bv.functions[0].symbol = SimpleNamespace(raw_name="renamed_main", short_name="renamed_main")
             run_export(bv, ExportConfig(output_dir=output_dir))
-            self.assertTrue((output_dir / "functions" / "0x101000.hlil.txt").exists())
+            self.assertTrue((output_dir / "functions" / "renamed_main.hlil.txt").exists())
             self.assertFalse(stale_file.exists())
             self.assertFalse(stale_optional.exists())
 
@@ -363,8 +363,8 @@ class ExportSnapshotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "snapshot"
             run_export(bv, ExportConfig(output_dir=output_dir, export_pseudoc=True))
-            rendered = (output_dir / "functions" / "0x88504.hlil.txt").read_text(encoding="utf-8")
-            pseudoc = (output_dir / "optional" / "pseudoc" / "0x88504.pseudoc.c").read_text(encoding="utf-8")
+            rendered = (output_dir / "functions" / "f.hlil.txt").read_text(encoding="utf-8")
+            pseudoc = (output_dir / "optional" / "pseudoc" / "f.pseudoc.c").read_text(encoding="utf-8")
 
         self.assertIn("0x88504", rendered)
         self.assertIn("note", rendered)
@@ -374,6 +374,19 @@ class ExportSnapshotTests(unittest.TestCase):
         self.assertNotIn("0x0000000000088504", rendered)
         self.assertIn("0x88508", pseudoc)
         self.assertIn("                  {", pseudoc)
+
+    def test_function_artifact_names_use_function_names_and_default_sub_names(self) -> None:
+        named = _Function(0x101000, "main")
+        unnamed = _Function(0x101200, None)
+        bv = _BinaryView([named, unnamed], _elf64(elf_type=2, entry=named.start, dynamic_entries=[]), named.start)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "snapshot"
+            run_export(bv, ExportConfig(output_dir=output_dir))
+
+            self.assertTrue((output_dir / "functions" / "main.hlil.txt").exists())
+            self.assertTrue((output_dir / "functions" / "sub_101200.hlil.txt").exists())
+            self.assertFalse((output_dir / "functions" / "0x101000.hlil.txt").exists())
 
     def test_background_task_progress_includes_name_or_id_and_clears_it_at_end(self) -> None:
         import binja_no_mcp.plugin as plugin
@@ -622,7 +635,7 @@ class ExportSnapshotTests(unittest.TestCase):
         self.assertTrue(function.reanalyzed)
         self.assertEqual(header["snapshot_status"], "partial")
         self.assertEqual(index[0]["export_status"], "failed")
-        self.assertFalse((cfg.output_dir / "functions" / "0x101000.hlil.txt").exists())
+        self.assertFalse((cfg.output_dir / "functions" / "main.hlil.txt").exists())
         self.assertIn("analysis-deferred", [failure.get("reason") for failure in failures])
 
     def test_skip_waits_for_a_terminal_workflow_state_before_continuing(self) -> None:
@@ -913,7 +926,7 @@ class ExportSnapshotTests(unittest.TestCase):
         self.assertEqual(index[0]["export_status"], "partial")
         self.assertIn("export-timeout", [failure.get("reason") for failure in failures])
 
-    def test_memory_ceiling_stops_the_session_without_aborting_analysis(self) -> None:
+    def test_memory_ceiling_skips_one_function_and_continues_without_aborting_analysis(self) -> None:
         import binja_no_mcp.export_runner as export_runner
 
         bv = self._executable_view()
@@ -944,6 +957,7 @@ class ExportSnapshotTests(unittest.TestCase):
 
             def begin_window(self) -> None:
                 self.begin_window_calls += 1
+                self.exceeded = False
 
             def end_window(self) -> MemoryWindow:
                 return MemoryWindow()
@@ -981,15 +995,15 @@ class ExportSnapshotTests(unittest.TestCase):
         self.assertEqual(summary.status, "partial")
         self.assertEqual(header["snapshot_status"], "partial")
         self.assertEqual(index[0]["export_status"], "partial")
-        self.assertEqual(index[1]["export_status"], "failed")
+        self.assertEqual(index[1]["export_status"], "exported")
         self.assertEqual(index[0]["memory_window"]["peak_private_usage"], 24 * 1024**3)
-        self.assertEqual(monitor.begin_window_calls, 1)
+        self.assertGreaterEqual(monitor.begin_window_calls, 2)
         self.assertTrue(monitor.started)
         self.assertTrue(monitor.stopped)
         self.assertEqual(bv.abort_analysis_calls, 0)
         self.assertEqual(memory_failure["memory_window"]["peak_private_usage"], 24 * 1024**3)
 
-    def test_memory_ceiling_seen_between_functions_prevents_the_next_export(self) -> None:
+    def test_memory_ceiling_at_a_new_function_boundary_does_not_block_export(self) -> None:
         import binja_no_mcp.export_runner as export_runner
 
         bv = self._executable_view()
@@ -1003,7 +1017,7 @@ class ExportSnapshotTests(unittest.TestCase):
                 return None
 
             def begin_window(self) -> None:
-                return None
+                self.exceeded = False
 
             def end_window(self) -> object:
                 return SimpleNamespace(to_dict=lambda: {})
@@ -1032,10 +1046,10 @@ class ExportSnapshotTests(unittest.TestCase):
             ]
             index = _index(output_dir)
 
-        self.assertEqual(summary.status, "partial")
-        self.assertEqual(rendered, [])
-        self.assertTrue(all(record["export_status"] == "failed" for record in index))
-        self.assertIn("memory-ceiling", [failure.get("reason") for failure in failures])
+        self.assertEqual(summary.status, "complete")
+        self.assertEqual(rendered, [function.start for function in bv.functions[:2]])
+        self.assertTrue(all(record["export_status"] == "exported" for record in index))
+        self.assertEqual(failures, [])
 
     def test_memory_monitor_records_peak_window_without_binary_view_access(self) -> None:
         from binja_no_mcp import resource_monitor
@@ -1057,6 +1071,23 @@ class ExportSnapshotTests(unittest.TestCase):
         self.assertEqual(window.peak_private_usage, 120)
         self.assertEqual(window.end_private_usage, 110)
         self.assertEqual(window.private_usage_delta, 110)
+
+    def test_memory_monitor_ignores_an_already_high_new_window_baseline(self) -> None:
+        from binja_no_mcp import resource_monitor
+
+        monitor = resource_monitor.ProcessMemoryMonitor(private_usage_limit_bytes=100)
+        samples = [
+            resource_monitor.ProcessMemorySample(private_usage=120, working_set=8),
+            resource_monitor.ProcessMemorySample(private_usage=130, working_set=9),
+            resource_monitor.ProcessMemorySample(private_usage=125, working_set=8),
+        ]
+
+        with patch.object(resource_monitor, "_process_memory_sample", side_effect=samples):
+            monitor.begin_window()
+            monitor._capture()
+            monitor.end_window()
+
+        self.assertFalse(monitor.exceeded)
 
     def test_each_exported_function_index_records_its_memory_window(self) -> None:
         import binja_no_mcp.export_runner as export_runner
@@ -1115,12 +1146,76 @@ class ExportSnapshotTests(unittest.TestCase):
         self.assertEqual(index[0]["memory_window"]["baseline_private_usage"], 10)
         self.assertEqual(index[1]["memory_window"]["baseline_private_usage"], 20)
 
-    def test_memory_ceiling_during_reanalysis_stops_before_artifact_export(self) -> None:
+    def test_incremental_export_reuses_successful_functions(self) -> None:
+        import binja_no_mcp.export_runner as export_runner
+
+        bv = self._executable_view(needs_update=True)
+        function_keys = [(function.start, "aarch64") for function in bv.functions]
+        first = bv.functions[0]
+        rendered: list[int] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "snapshot"
+            first_summary = run_export(
+                bv,
+                ExportConfig(output_dir=output_dir, reanalyze_before_export=False),
+                function_keys=function_keys,
+            )
+            self.assertEqual(first_summary.status, "partial")
+
+            first.needs_update = False
+
+            def render_hlil(hlil: object, declaration: str | None) -> str:
+                rendered.append(hlil.source_function.start)
+                return "return;\n"
+
+            with patch.object(export_runner, "render_hlil", render_hlil):
+                summary = run_export(
+                    bv,
+                    ExportConfig(output_dir=output_dir, reanalyze_before_export=False, incremental=True),
+                    function_keys=function_keys,
+                )
+
+            header = json.loads((output_dir / "meta" / "binary.json").read_text(encoding="utf-8"))
+            index = _index(output_dir)
+
+        self.assertEqual(summary.status, "complete")
+        self.assertEqual(rendered, [first.start])
+        self.assertEqual(header["exported_function_count"], len(function_keys))
+        self.assertTrue(all(record["export_status"] == "exported" for record in index))
+
+    def test_incremental_export_accepts_bndb_for_the_same_original_binary(self) -> None:
+        # Given: a partial snapshot created from an original binary file.
+        bv = self._executable_view(needs_update=True)
+        function_keys = [(function.start, "aarch64") for function in bv.functions]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "snapshot"
+            run_export(
+                bv,
+                ExportConfig(output_dir=output_dir, reanalyze_before_export=False),
+                function_keys=function_keys,
+            )
+            bv.functions[0].needs_update = False
+            bv.file.filename = "fixture.bndb"
+            bv.file.original_filename = "fixture.so"
+
+            # When: the same analysis is resumed from its Binary Ninja database.
+            summary = run_export(
+                bv,
+                ExportConfig(output_dir=output_dir, reanalyze_before_export=False, incremental=True),
+                function_keys=function_keys,
+            )
+
+        # Then: the snapshot is accepted and completed.
+        self.assertEqual(summary.status, "complete")
+
+    def test_memory_ceiling_during_reanalysis_skips_the_function_and_continues(self) -> None:
         import binja_no_mcp.export_runner as export_runner
         import binja_no_mcp.plugin as plugin
 
         bv = self._executable_view(needs_update=True)
-        function = bv.functions[0]
+        function, next_function = bv.functions[:2]
         cfg = ExportConfig(output_dir=Path(tempfile.mkdtemp()), reanalyze_before_export=True)
 
         class MemoryWindow:
@@ -1148,6 +1243,7 @@ class ExportSnapshotTests(unittest.TestCase):
 
             def begin_window(self) -> None:
                 self.begin_window_calls += 1
+                self.exceeded = False
 
             def end_window(self) -> MemoryWindow:
                 self.end_window_calls += 1
@@ -1160,7 +1256,7 @@ class ExportSnapshotTests(unittest.TestCase):
         task = SimpleNamespace(
             _bv=bv,
             _cfg=cfg,
-            _function_keys=[(function.start, "aarch64")],
+            _function_keys=[(function.start, "aarch64"), (next_function.start, "aarch64")],
             _function_labels={},
             cancelled=False,
             progress="",
@@ -1181,7 +1277,8 @@ class ExportSnapshotTests(unittest.TestCase):
             is_memory_ceiling_reached: object = None,
             on_memory_ceiling: object = None,
         ) -> object:
-            monitor.exceeded = True
+            if target is function:
+                monitor.exceeded = True
             return SimpleNamespace(completed=True, reason=None, elapsed_seconds=4.0)
 
         with (
@@ -1204,9 +1301,11 @@ class ExportSnapshotTests(unittest.TestCase):
 
         self.assertEqual(header["snapshot_status"], "partial")
         self.assertEqual(index[0]["export_status"], "failed")
-        self.assertFalse((cfg.output_dir / "functions" / "0x101000.hlil.txt").exists())
-        self.assertEqual(monitor.begin_window_calls, 1)
-        self.assertEqual(monitor.end_window_calls, 1)
+        self.assertEqual(index[1]["export_status"], "exported")
+        self.assertFalse((cfg.output_dir / "functions" / "main.hlil.txt").exists())
+        self.assertTrue((cfg.output_dir / "functions" / "target.hlil.txt").exists())
+        self.assertGreaterEqual(monitor.begin_window_calls, 2)
+        self.assertGreaterEqual(monitor.end_window_calls, 2)
         self.assertTrue(monitor.stopped)
         self.assertIn("memory-ceiling", [failure.get("reason") for failure in failures])
 
@@ -1442,9 +1541,15 @@ class ExportSnapshotTests(unittest.TestCase):
             value = 901 if "time limit" in label else 25
             return SimpleNamespace(result=value)
 
+        checkbox_fields: list[str] = []
+
+        def checkbox_field(label: str, default: bool) -> object:
+            checkbox_fields.append(label)
+            return SimpleNamespace(result=label.startswith("Incremental"))
+
         with (
             patch.object(plugin, "DirectoryNameField", lambda label, default_name: SimpleNamespace(result=str(output_dir))),
-            patch.object(plugin, "CheckboxField", lambda label, default: SimpleNamespace(result=default)),
+            patch.object(plugin, "CheckboxField", checkbox_field),
             patch.object(plugin, "IntegerField", integer_field),
             patch.object(plugin, "get_form_input", return_value=True),
         ):
@@ -1454,11 +1559,13 @@ class ExportSnapshotTests(unittest.TestCase):
         assert cfg is not None
         self.assertEqual(cfg.function_time_limit_seconds, 901)
         self.assertEqual(cfg.private_memory_limit_gib, 25)
+        self.assertTrue(cfg.incremental)
+        self.assertIn("Incremental export (unchecked = full export; reuse successful functions)", checkbox_fields)
         self.assertEqual(
             integer_fields,
             [
                 ("Function analysis/export time limit (seconds)", 900),
-                ("Binary Ninja PrivateUsage limit (GiB)", 24),
+                ("Per-function PrivateUsage ceiling (GiB)", 24),
             ],
         )
 

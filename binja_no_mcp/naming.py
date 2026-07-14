@@ -23,8 +23,8 @@ def function_id(start: int) -> str:
     return f"0x{start:x}"
 
 
-def function_file_stem(start: int) -> str:
-    return function_id(start)
+def function_file_stem(name: str) -> str:
+    return sanitize_name(name)
 
 
 def hex_addr(value: int | None) -> str | None:

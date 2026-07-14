@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
@@ -29,6 +30,115 @@ from .utils import ExportPaths
 
 
 FunctionKey = tuple[int, str | None]
+
+
+def _required_artifacts(cfg: ExportConfig) -> set[str]:
+    artifacts = {"meta"}
+    if cfg.export_hlil:
+        artifacts.add("hlil")
+    if cfg.export_pseudoc:
+        artifacts.add("pseudoc")
+    if cfg.export_mlil:
+        artifacts.add("mlil")
+    if cfg.export_mlil_ssa:
+        artifacts.add("mlil_ssa")
+    if cfg.export_llil:
+        artifacts.add("llil")
+    return artifacts
+
+
+def _record_has_required_artifacts(paths: ExportPaths, record: dict[str, object], required: set[str]) -> bool:
+    artifacts = record.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return False
+    for artifact in required:
+        relative_path = artifacts.get(artifact)
+        if not isinstance(relative_path, str) or not (paths.root / relative_path).is_file():
+            return False
+    return True
+
+
+def _load_reused_index_records(
+    paths: ExportPaths, bv: object, cfg: ExportConfig, function_keys: list[FunctionKey]
+) -> list[dict[str, object]]:
+    if not paths.binary_meta_path.is_file():
+        raise FileNotFoundError(f"Incremental export requires {paths.binary_meta_path}")
+    if not paths.function_index_path.is_file():
+        raise FileNotFoundError(f"Incremental export requires {paths.function_index_path}")
+
+    try:
+        binary_meta = json.loads(paths.binary_meta_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Incremental export cannot read {paths.binary_meta_path}: {exc}") from exc
+    if not isinstance(binary_meta, dict):
+        raise ValueError(f"Incremental export requires an object in {paths.binary_meta_path}")
+
+    file_metadata = getattr(bv, "file", None)
+    current_filenames = {
+        str(filename)
+        for filename in (
+            getattr(file_metadata, "filename", None),
+            getattr(file_metadata, "original_filename", None),
+        )
+        if filename
+    }
+    if binary_meta.get("filename") not in current_filenames:
+        raise ValueError("Incremental export target does not match the existing snapshot")
+
+    available_ids = {function_id(start) for start, _ in function_keys}
+    required_artifacts = _required_artifacts(cfg)
+    records_by_id: dict[str, dict[str, object]] = {}
+    for line_number, line in enumerate(paths.function_index_path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Incremental export cannot read {paths.function_index_path} line {line_number}: {exc}") from exc
+        if not isinstance(record, dict):
+            raise ValueError(f"Incremental export requires object records in {paths.function_index_path}")
+        record_id = record.get("id")
+        if (
+            isinstance(record_id, str)
+            and record_id in available_ids
+            and record.get("export_status") == "exported"
+            and _record_has_required_artifacts(paths, record, required_artifacts)
+        ):
+            records_by_id[record_id] = record
+
+    return [records_by_id[function_id(start)] for start, _ in function_keys if function_id(start) in records_by_id]
+
+
+def _restore_reused_records(session: ExportSession, records: list[dict[str, object]]) -> None:
+    starts_by_id = {function_id(start): start for start, _ in session.function_keys}
+    for record in records:
+        record_id = record.get("id")
+        if not isinstance(record_id, str):
+            continue
+        _append_index_record(session, starts_by_id[record_id], record)
+        session.exported_function_count += 1
+        artifacts = record.get("artifacts")
+        if not isinstance(artifacts, dict):
+            continue
+        session.meta_exported += int("meta" in artifacts)
+        session.hlil_exported += int("hlil" in artifacts)
+        session.pseudoc_exported += int("pseudoc" in artifacts)
+        session.mlil_exported += int("mlil" in artifacts)
+        session.mlil_ssa_exported += int("mlil_ssa" in artifacts)
+        session.llil_exported += int("llil" in artifacts)
+
+
+def _clear_incremental_global_records(paths: ExportPaths) -> None:
+    for path in (
+        paths.startup_entries_path,
+        paths.failures_path,
+        paths.sections_path,
+        paths.segments_path,
+        paths.strings_path,
+        paths.data_vars_path,
+        paths.symbols_path,
+    ):
+        path.unlink(missing_ok=True)
 
 
 @dataclass(slots=True)
@@ -231,7 +341,6 @@ def record_function_memory_ceiling(
         )
     )
     _append_index_record(session, start, _failed_index_record(start, name, message, memory_window=memory_window))
-    session.stop_requested = True
 
 
 def record_function_analysis_cancelled(
@@ -401,7 +510,6 @@ def _record_memory_ceiling(
             memory_window=memory_window,
         ),
     )
-    session.stop_requested = True
 
 
 def _record_session_memory_ceiling(session: ExportSession) -> None:
@@ -508,7 +616,7 @@ def _export_hlil_family_for_function(
         return hlil_file, pseudoc_file, errors, True
 
     name, _, _ = function_identity(func)
-    stem = function_file_stem(func.start)
+    stem = function_file_stem(name)
     produced = False
 
     for hlil in bv.hlil_functions(function_generator=(item for item in [func])):
@@ -567,7 +675,7 @@ def _export_mlil_family_for_function(
         return mlil_file, mlil_ssa_file, errors, True
 
     name, _, _ = function_identity(func)
-    stem = function_file_stem(func.start)
+    stem = function_file_stem(name)
     produced = False
 
     for mlil in bv.mlil_functions(function_generator=(item for item in [func])):
@@ -626,7 +734,7 @@ def _export_llil_for_function(
         return llil_file, errors, True
 
     name, _, _ = function_identity(func)
-    stem = function_file_stem(func.start)
+    stem = function_file_stem(name)
     try:
         llil = getattr(func, "low_level_il", None)
         if llil is None:
@@ -646,11 +754,15 @@ def _export_llil_for_function(
 
 def prepare_export_session(bv: object, cfg: ExportConfig, function_keys: list[FunctionKey]) -> ExportSession:
     paths = ExportPaths.from_root(Path(cfg.output_dir))
-    prepare_output_tree(paths, cfg.overwrite)
+    reused_records = _load_reused_index_records(paths, bv, cfg, function_keys) if cfg.incremental else []
+    prepare_output_tree(paths, cfg.overwrite, reuse_existing=cfg.incremental)
+    if cfg.incremental:
+        _clear_incremental_global_records(paths)
     memory_monitor = ProcessMemoryMonitor(cfg.private_memory_limit_gib * 1024**3)
     memory_monitor.start()
     try:
         session = ExportSession(cfg=cfg, paths=paths, function_keys=function_keys, memory_monitor=memory_monitor)
+        _restore_reused_records(session, reused_records)
         write_json(paths.export_config_path, cfg.to_dict())
         write_json(paths.binary_meta_path, collect_binary_metadata(bv, len(function_keys)))
         return session
@@ -665,13 +777,11 @@ def export_function(
     function_key: FunctionKey,
     is_cancelled: Callable[[], bool] | None = None,
 ) -> None:
-    if session.stop_requested:
+    start, _ = function_key
+    if session.stop_requested or start in session.indexed_starts:
         return
     begin_memory_window(session)
-    if stop_for_memory_ceiling(session):
-        return
     func = _resolve_one_function(bv, function_key)
-    start, _ = function_key
     if func is None:
         error = "Function disappeared before export"
         memory_window = _end_memory_window(session)
@@ -796,7 +906,7 @@ def export_function(
         )
         if should_stop_at_boundary():
             return
-        meta_name = f"{function_file_stem(func.start)}.meta.json"
+        meta_name = f"{function_file_stem(name)}.meta.json"
         write_json(session.paths.functions_dir / meta_name, meta.to_dict())
         if should_stop_at_boundary():
             return
@@ -912,9 +1022,9 @@ def run_export(
 
     session = prepare_export_session(bv, cfg, function_keys)
     for function_key in function_keys:
-        if stop_for_memory_ceiling(session):
-            break
+        if function_key[0] in session.indexed_starts:
+            continue
         export_function(session, bv, function_key)
-        if session.stop_requested:
+        if session.cancelled:
             break
     return finalize_export_session(session, bv)

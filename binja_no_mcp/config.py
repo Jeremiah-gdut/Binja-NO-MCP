@@ -24,6 +24,7 @@ class ExportConfig:
     write_failures: bool = True
     function_time_limit_seconds: int = 900
     private_memory_limit_gib: int = 24
+    incremental: bool = False
 
     def __post_init__(self) -> None:
         output_dir = Path(self.output_dir).expanduser()

@@ -12,6 +12,7 @@ Current UI workflow:
 - freezes the recognized function set before export scheduling
 - reanalyzes each frozen function and exports it immediately after its analysis completes by default
 - lets you choose the output directory manually in a form
+- supports a full replacement export or an incremental export that retries only unfinished functions in an existing snapshot
 - exports raw HLIL linear-view text by default
 - preserves address comments from the current analysis view in exported linear HLIL / pseudo-C when available
 - lets you choose pseudo-C / MLIL / MLIL SSA / LLIL as optional exports in the UI
@@ -31,33 +32,34 @@ binja-no-mcp-export/
     sections.json
     segments.json
   functions/
-    0x88504.hlil.txt
-    0x88504.meta.json
+    main.hlil.txt
+    main.meta.json
   data/
     strings.jsonl
     data_vars.jsonl
     symbols.jsonl
   optional/
     pseudoc/
-      0x88504.pseudoc.c
+      main.pseudoc.c
     mlil/
-      0x88504.mlil.txt
+      main.mlil.txt
     mlil_ssa/
-      0x88504.mlil_ssa.txt
+      main.mlil_ssa.txt
     llil/
-      0x88504.llil.txt
+      main.llil.txt
 ```
 
 ## UI Usage
 
 1. Open the sample in Binary Ninja and let the analysis state settle to exactly what you want to export.
 2. Run `Plugins -> Export for AI`.
-3. In the form, choose the output directory.
+3. In the form, choose the output directory and either full export (the default) or incremental export.
 4. Select which IL layers to export.
 
 Defaults:
 
 - Reanalyze before export: enabled
+- Incremental export: disabled (full replacement export)
 - HLIL: enabled
 - pseudo-C: disabled
 - MLIL: disabled
@@ -78,7 +80,7 @@ Always exported:
 - `data/data_vars.jsonl`
 - `data/symbols.jsonl`
 
-`meta/binary.json` is the snapshot header. Read it first for schema, status, and function counts; then read startup entries and the function index. A new export replaces the previous snapshot.
+`meta/binary.json` is the snapshot header. Read it first for schema, status, and function counts; then read startup entries and the function index. A full export replaces the previous snapshot. Incremental export requires the same target snapshot, reuses only functions already marked exported with all selected artifacts present, and retries every other function.
 
 ## Notes
 
@@ -86,6 +88,8 @@ Always exported:
 - The UI command serializes `reanalyze current function -> analysis completion -> export current function`.
 - `run_export` itself does not call `update_analysis_and_wait()`.
 - Optional pseudo-C / MLIL / MLIL SSA / LLIL exports are only generated when you explicitly enable them in the form.
+- Function artifact filenames use their sanitized Binary Ninja function names; unnamed functions use `sub_<offset>`.
+- The PrivateUsage ceiling is evaluated per function window: a crossing skips that function and then allows the next one to run.
 
 ## Development Notes
 

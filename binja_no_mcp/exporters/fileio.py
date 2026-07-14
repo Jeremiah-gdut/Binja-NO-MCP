@@ -8,13 +8,17 @@ from typing import Iterable, Mapping
 from ..utils import ExportPaths
 
 
-def prepare_output_tree(paths: ExportPaths, overwrite: bool) -> None:
+def prepare_output_tree(paths: ExportPaths, overwrite: bool, *, reuse_existing: bool = False) -> None:
     managed_dirs = [
         paths.meta_dir,
         paths.functions_dir,
         paths.data_dir,
         paths.optional_dir,
     ]
+    if reuse_existing:
+        for directory in [paths.root, *managed_dirs]:
+            directory.mkdir(parents=True, exist_ok=True)
+        return
     if not overwrite and any(directory.exists() for directory in managed_dirs):
         raise FileExistsError(f"output tree already exists under {paths.root}")
     if overwrite:

@@ -19,7 +19,6 @@ from .export_runner import (
     record_function_analysis_failure,
     record_function_memory_ceiling,
     run_export,
-    stop_for_memory_ceiling,
 )
 from .naming import function_id
 from . import analysis_guard
@@ -97,8 +96,7 @@ def _request_memory_ceiling_halt(task: object, function_key: tuple[int, str | No
             ):
                 return
         try:
-            if not _halt_function_workflow(func):
-                log_error("Binja-NO-MCP function workflow halt was rejected after the memory ceiling was reached")
+            _halt_function_workflow(func)
         except Exception as exc:
             log_error(f"Binja-NO-MCP could not request a memory-ceiling workflow halt: {exc}")
 
@@ -198,9 +196,10 @@ def _default_output_dir(bv: object) -> Path:
 
 def _prompt_export_config(bv: object) -> ExportConfig | None:
     output_dir = DirectoryNameField("Output directory", default_name=str(_default_output_dir(bv)))
+    incremental = CheckboxField("Incremental export (unchecked = full export; reuse successful functions)", False)
     reanalyze_before_export = CheckboxField("Reanalyze frozen functions before export", True)
     function_time_limit_seconds = IntegerField("Function analysis/export time limit (seconds)", default=900)
-    private_memory_limit_gib = IntegerField("Binary Ninja PrivateUsage limit (GiB)", default=24)
+    private_memory_limit_gib = IntegerField("Per-function PrivateUsage ceiling (GiB)", default=24)
     export_hlil = CheckboxField("Export raw HLIL (.hlil.txt)", True)
     export_pseudoc = CheckboxField("Export pseudo-C (.pseudoc.c)", False)
     export_mlil = CheckboxField("Export MLIL (.mlil.txt)", False)
@@ -213,6 +212,7 @@ def _prompt_export_config(bv: object) -> ExportConfig | None:
             None,
             output_dir,
             None,
+            incremental,
             reanalyze_before_export,
             function_time_limit_seconds,
             private_memory_limit_gib,
@@ -252,6 +252,7 @@ def _prompt_export_config(bv: object) -> ExportConfig | None:
 
     return ExportConfig(
         output_dir=Path(output_dir.result),
+        incremental=bool(incremental.result),
         reanalyze_before_export=bool(reanalyze_before_export.result),
         function_time_limit_seconds=int(function_time_limit_seconds.result),
         private_memory_limit_gib=int(private_memory_limit_gib.result),
@@ -363,8 +364,8 @@ class _ExportTask(BackgroundTaskThread):
                 if self.cancelled:
                     session.cancelled = True
                     break
-                if stop_for_memory_ceiling(session):
-                    break
+                if function_key[0] in session.indexed_starts:
+                    continue
 
                 label = self._function_labels.get(function_key)
                 if label is None:
@@ -443,7 +444,7 @@ class _ExportTask(BackgroundTaskThread):
                                 func,
                                 analysis_result.elapsed_seconds,
                             )
-                            break
+                            continue
                         if analysis_result.reason == "skipped":
                             record_function_analysis_failure(
                                 session,
@@ -468,7 +469,7 @@ class _ExportTask(BackgroundTaskThread):
                     break
                 self.progress = _progress_text("Exporting", index, total, label, self._cfg)
                 export_function(session, self._bv, function_key, lambda: self.cancelled)
-                if session.stop_requested or session.cancelled:
+                if session.cancelled:
                     break
 
             if self.cancelled:
